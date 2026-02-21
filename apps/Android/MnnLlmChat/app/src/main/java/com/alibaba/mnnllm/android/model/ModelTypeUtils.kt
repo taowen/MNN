@@ -47,7 +47,8 @@ object ModelTypeUtils {
     }
 
     fun isOmni(modelName: String): Boolean {
-        return modelName.lowercase(Locale.getDefault()).contains("omni")
+        val lower = modelName.lowercase(Locale.getDefault())
+        return lower.contains("omni") || lower.contains("audio-chat")
     }
 
     fun isSupportThinkingSwitchByTags(extraTags: List<String>): Boolean {

@@ -69,7 +69,12 @@ class LlmSession (
                     .map { obj: String? -> obj!! }
                     .collect(Collectors.toList())
         }
-        val config = ModelConfig.loadMergedConfig(configPath, getExtraConfigFile(modelId))!!
+        val config = ModelConfig.loadMergedConfig(configPath, getExtraConfigFile(modelId))
+        if (config == null) {
+            Log.e(TAG, "Failed to load config from $configPath — check file permissions (ls -la) and JSON validity")
+            modelLoading = false
+            return
+        }
         var rootCacheDir: String? = ""
         if (config.useMmap == true) {
             rootCacheDir = MmapUtils.getMmapDir(modelId)
@@ -80,7 +85,12 @@ class LlmSession (
             put("mmap_dir", rootCacheDir ?: "")
             put("keep_history", keepHistory)
         }
-        val llmConfig = ModelConfig.loadMergedConfig(configPath, getExtraConfigFile(modelId))!!
+        val llmConfig = ModelConfig.loadMergedConfig(configPath, getExtraConfigFile(modelId))
+        if (llmConfig == null) {
+            Log.e(TAG, "Failed to load llmConfig from $configPath")
+            modelLoading = false
+            return
+        }
         // Override backend type from constructor only if not null
         if (backendType != null) {
             llmConfig.backendType = backendType

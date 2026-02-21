@@ -69,7 +69,9 @@ Omni::Omni(std::shared_ptr<LlmConfig> config) : Llm(config) {
         mVisionMaxSize = config->config_.value("image_max_size", mVisionMaxSize);
         mVisionGlobal = config->config_.value("global_image", mVisionGlobal);
     }
-    if (config->is_audio()) {}
+    if (config->is_audio()) {
+        mAudioPad = config->config_.value("audio_pad", mAudioPad);
+    }
 }
 
 bool Omni::load() {

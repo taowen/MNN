@@ -32,6 +32,8 @@ import com.alibaba.mnnllm.android.audio.AudioChunksPlayer
 import com.alibaba.mnnllm.android.utils.VoiceModelPathUtils
 import com.alibaba.mnnllm.android.utils.PreferenceUtils
 import com.alibaba.mnnllm.android.BuildConfig
+import com.alibaba.mnnllm.android.llm.LlmSession
+import com.alibaba.mnnllm.android.llm.GenerateProgressListener
 import com.alibaba.mnnllm.android.modelist.ModelListManager
 import com.taobao.meta.avatar.tts.TtsService
 import kotlinx.coroutines.CoroutineScope
@@ -100,10 +102,17 @@ class DebugActivity : AppCompatActivity() {
     private val testCases = listOf(
         TestCase("asr", "ASR Test", R.layout.debug_test_asr),
         TestCase("tts", "TTS Test", R.layout.debug_test_tts),
+        TestCase("llm", "LLM Test", R.layout.debug_test_llm),
         TestCase("video", "Video Decoder Test", R.layout.debug_test_video),
         TestCase("scan", "Model Scan Test", R.layout.debug_test_scan),
         TestCase("settings", "Debug Settings", R.layout.debug_test_settings)
     )
+
+    private var llmConfigPathInput: EditText? = null
+    private var llmLoadButton: Button? = null
+    private var llmPromptInput: EditText? = null
+    private var llmSendButton: Button? = null
+    private var llmSession: LlmSession? = null
 
     private var scanModelButton: Button? = null
 
@@ -173,6 +182,7 @@ class DebugActivity : AppCompatActivity() {
         when (testCase.id) {
             "asr" -> initAsrViews(view)
             "tts" -> initTtsViews(view)
+            "llm" -> initLlmViews(view)
             "video" -> initVideoViews(view)
             "scan" -> initScanViews(view)
             "settings" -> initSettingsViews(view)
@@ -204,6 +214,89 @@ class DebugActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 log("Scan failed: ${e.message}")
                 Log.e(TAG, "Scan failed", e)
+            }
+        }
+    }
+
+    private fun initLlmViews(parentView: View) {
+        llmConfigPathInput = parentView.findViewById(R.id.llmConfigPathInput)
+        llmLoadButton = parentView.findViewById(R.id.llmLoadButton)
+        llmPromptInput = parentView.findViewById(R.id.llmPromptInput)
+        llmSendButton = parentView.findViewById(R.id.llmSendButton)
+
+        llmLoadButton?.setOnClickListener {
+            startLlmLoad()
+        }
+
+        llmSendButton?.setOnClickListener {
+            sendLlmPrompt()
+        }
+    }
+
+    private fun startLlmLoad() {
+        val configPath = llmConfigPathInput?.text?.toString()?.trim() ?: return
+        if (configPath.isEmpty()) {
+            log("Config path is empty")
+            return
+        }
+        llmLoadButton?.isEnabled = false
+        log("Loading model from: $configPath")
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                llmSession = LlmSession("debug", System.currentTimeMillis().toString(), configPath, null)
+                llmSession!!.setKeepHistory(true)
+                llmSession!!.load()
+                withContext(Dispatchers.Main) {
+                    log("Model loaded successfully")
+                    llmPromptInput?.isEnabled = true
+                    llmPromptInput?.setText("你好")
+                    llmSendButton?.isEnabled = true
+                    llmLoadButton?.isEnabled = true
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    log("Load failed: ${e.message}")
+                    llmLoadButton?.isEnabled = true
+                }
+            }
+        }
+    }
+
+    private fun sendLlmPrompt() {
+        val prompt = llmPromptInput?.text?.toString()?.trim() ?: return
+        if (prompt.isEmpty()) {
+            log("Prompt is empty")
+            return
+        }
+        val session = llmSession
+        if (session == null) {
+            log("Model not loaded. Please load first.")
+            return
+        }
+        llmSendButton?.isEnabled = false
+        log("Sending prompt: $prompt")
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val result = session.generate(prompt, emptyMap(), object : GenerateProgressListener {
+                    override fun onProgress(progress: String?): Boolean {
+                        if (progress != null) {
+                            runOnUiThread {
+                                logTextView.append(progress)
+                                scrollView.post { scrollView.fullScroll(View.FOCUS_DOWN) }
+                            }
+                        }
+                        return false
+                    }
+                })
+                withContext(Dispatchers.Main) {
+                    log("\n--- Generation complete ---")
+                    llmSendButton?.isEnabled = true
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    log("Generate failed: ${e.message}")
+                    llmSendButton?.isEnabled = true
+                }
             }
         }
     }
@@ -563,5 +656,7 @@ class DebugActivity : AppCompatActivity() {
         super.onDestroy()
         stopAsrTest()
         stopTtsTest()
+        llmSession?.release()
+        llmSession = null
     }
 }

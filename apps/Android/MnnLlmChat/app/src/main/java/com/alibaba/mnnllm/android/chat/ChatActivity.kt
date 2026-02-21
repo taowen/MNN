@@ -97,6 +97,7 @@ class ChatActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Log.w(TAG, "onCreate: START")
         binding = ActivityChatBinding.inflate(layoutInflater)
         setContentView(binding.root)
         val toolbar = binding.toolbar
@@ -104,8 +105,11 @@ class ChatActivity : AppCompatActivity() {
 
         this.modelName = intent.getStringExtra("modelName")?:""
         this.modelId = intent.getStringExtra("modelId")
+        Log.w(TAG, "onCreate: modelName='$modelName' modelId='$modelId'")
         if (this.modelName.isEmpty() || this.modelId.isNullOrEmpty()) {
+            Log.e(TAG, "onCreate: missing modelName='$modelName' or modelId='$modelId', finishing")
             finish()
+            return
         }
         dateFormat = SimpleDateFormat("hh:mm aa", Locale.getDefault())
         layoutModelLoading = findViewById(R.id.layout_model_loading)
@@ -115,18 +119,23 @@ class ChatActivity : AppCompatActivity() {
                 showModelSelectionDialog()
             }
         }
+        Log.w(TAG, "onCreate: calling setupView")
         setupView(this.modelId!!, this.modelName)
+        Log.w(TAG, "onCreate: setupView done, calling setupSession")
         this.setupSession()
+        Log.w(TAG, "onCreate: setupSession done, calling initializeVoiceModelsChecker")
         initializeVoiceModelsChecker()
+        Log.w(TAG, "onCreate: DONE")
     }
 
     private fun setupView(modelId:String, modelName: String) {
+        Log.w(TAG, "setupView: START modelId=$modelId modelName=$modelName")
         this.modelId = modelId
         this.modelName = modelName
         isDiffusion = ModelTypeUtils.isDiffusionModel(modelName)
         isAudioModel = ModelTypeUtils.isAudioModel(modelId)
         binding.modelSwitcher.text = modelName
-        
+
         // Hide model switcher click functionality for diffusion models
         val dropdownArrow = binding.modelSwitcher.findViewById<View>(R.id.iv_dropdown_arrow)
         if (isDiffusion) {
@@ -140,13 +149,18 @@ class ChatActivity : AppCompatActivity() {
 //            binding.modelSwitcher.setBackgroundResource(R.drawable.bg_rounded_dropdown)
             dropdownArrow?.visibility = View.VISIBLE
         }
-        
+
+        Log.w(TAG, "setupView: creating ChatPresenter")
         chatPresenter = ChatPresenter(this, modelName, modelId)
         setChatPresenter(chatPresenter)
+        Log.w(TAG, "setupView: creating ChatInputComponent")
         chatInputModule = ChatInputComponent(this, binding, modelId, modelName)
+        Log.w(TAG, "setupView: setupChatListComponent")
         setupChatListComponent()
+        Log.w(TAG, "setupView: setupInputModule")
         setupInputModule()
         binding.modelSwitcher.text = modelName
+        Log.w(TAG, "setupView: DONE")
     }
 
     private fun onSessionCreated() {
@@ -187,10 +201,12 @@ class ChatActivity : AppCompatActivity() {
     }
 
     private fun setupSession() {
+        Log.w(TAG, "setupSession: creating session for modelId=$modelId modelName=$modelName")
         chatSession = chatPresenter.createSession()
         sessionId = chatSession!!.sessionId
+        Log.w(TAG, "setupSession: session created, sessionId=$sessionId")
         onSessionCreated()
-        Log.d(TAG, "current SessionId: $sessionId")
+        Log.w(TAG, "setupSession: calling chatPresenter.load()")
         chatPresenter.load()
     }
 

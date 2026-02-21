@@ -3,6 +3,7 @@
 package com.alibaba.mnnllm.android.llm
 
 import android.text.TextUtils
+import android.util.Log
 import com.alibaba.mnnllm.android.chat.model.ChatDataItem
 import com.alibaba.mnnllm.android.model.ModelTypeUtils
 
@@ -28,12 +29,13 @@ class ChatService {
         configPath: String?,
         useNewConfig: Boolean = false
     ): ChatSession {
+        Log.w(TAG, "createSession: modelId=$modelId modelName=$modelName configPath=$configPath")
         val sessionId = if (TextUtils.isEmpty(sessionIdParam)) {
             System.currentTimeMillis().toString()
         } else {
             sessionIdParam!!
         }
-        
+
         val session = if (ModelTypeUtils.isDiffusionModel(modelName)) {
             DiffusionSession(sessionId, configPath!!, historyList)
         } else {
@@ -41,14 +43,15 @@ class ChatService {
             llmSession.supportOmni = ModelTypeUtils.isOmni(modelName)
             llmSession
         }
-        
+
         // Store in appropriate map
         if (session is LlmSession) {
             transformerSessionMap[sessionId] = session
         } else {
             diffusionSessionMap[sessionId] = session
         }
-        
+
+        Log.w(TAG, "createSession: created ${session::class.simpleName} sessionId=$sessionId supportOmni=${(session as? LlmSession)?.supportOmni}")
         return session
     }
 
@@ -105,6 +108,7 @@ class ChatService {
     }
 
     companion object {
+        private const val TAG = "ChatService"
         private var instance: ChatService? = null
 
         @JvmStatic

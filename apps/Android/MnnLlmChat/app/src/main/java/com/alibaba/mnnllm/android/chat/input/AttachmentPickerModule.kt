@@ -45,9 +45,11 @@ class AttachmentPickerModule(private val activity: ChatActivity) {
     private val imagePreviewAdapter: ImagePreviewAdapter
 
     init {
+        Log.w(TAG, "init: START modelId=${activity.modelId}")
         takePhotoView = activity.findViewById(R.id.more_item_camera)
         chooseImageView = activity.findViewById(R.id.more_item_photo)
         chooseVideoView = activity.findViewById(R.id.more_item_video)
+        Log.w(TAG, "init: findViewById done for camera/photo/video")
         if (ModelTypeUtils.isVisualModel(activity.modelId!!)) {
             takePhotoView.setOnClickListener { v: View? -> takePhoto() }
             chooseImageView.setOnClickListener { v: View? -> chooseImageView() }
@@ -66,6 +68,7 @@ class AttachmentPickerModule(private val activity: ChatActivity) {
         } else {
             chooseAudioView.visibility = View.GONE
         }
+        Log.w(TAG, "init: audio/video click listeners done")
         val voiceChatView = activity.findViewById<View>(R.id.more_item_voice_chat)
         //disable temporary
         voiceChatView.visibility = View.GONE
@@ -75,6 +78,7 @@ class AttachmentPickerModule(private val activity: ChatActivity) {
         imagePreviewDelete = activity.findViewById(R.id.image_preview_delete)
         selectAttachmentLayoutParent = activity.findViewById(R.id.layout_more_menu)
         imagePreviewDelete.setOnClickListener { v: View? -> deletePreviewImage() }
+        Log.w(TAG, "init: preview views done")
 
         imagePreviewAdapter = ImagePreviewAdapter { uri ->
             imagePreviewAdapter.removeImage(uri)
@@ -87,6 +91,7 @@ class AttachmentPickerModule(private val activity: ChatActivity) {
             }
         }
         imagePreviewRecycler.adapter = imagePreviewAdapter
+        Log.w(TAG, "init: DONE")
     }
 
     private fun deletePreviewImage() {

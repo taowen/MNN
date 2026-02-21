@@ -58,6 +58,7 @@ object CrashUtil : Thread.UncaughtExceptionHandler {
     }
 
     override fun uncaughtException(thread: Thread, ex: Throwable) {
+        Log.e(TAG, "UNCAUGHT EXCEPTION on thread ${thread.name}", ex)
         saveJavaCrash(thread, ex)
         defaultHandler?.uncaughtException(thread, ex) ?: run {
             Process.killProcess(Process.myPid())
@@ -67,6 +68,7 @@ object CrashUtil : Thread.UncaughtExceptionHandler {
 
 
     private fun saveJavaCrash(thread: Thread, ex: Throwable) {
+        Log.e(TAG, "saveJavaCrash: saving crash from thread ${thread.name}: ${ex.message}")
         val ts = dateFormat.format(Date())
         val file = File(crashDir, "crash_$ts.log")
         FileWriter(file).use { fw ->
@@ -85,11 +87,20 @@ object CrashUtil : Thread.UncaughtExceptionHandler {
         val sb = StringBuilder()
         try {
             val process = Runtime.getRuntime().exec(arrayOf("logcat", *args))
-            BufferedReader(InputStreamReader(process.inputStream)).use { br ->
-                br.lineSequence().forEach { sb.appendLine(it) }
+            val reader = BufferedReader(InputStreamReader(process.inputStream))
+            val startTime = System.currentTimeMillis()
+            val timeoutMs = 3000L
+            while (System.currentTimeMillis() - startTime < timeoutMs) {
+                if (reader.ready()) {
+                    val line = reader.readLine() ?: break
+                    sb.appendLine(line)
+                } else {
+                    Thread.sleep(10)
+                }
             }
-        } catch (ioe: IOException) {
-            sb.appendLine("Failed to collect logcat: \${ioe.message}")
+            process.destroy()
+        } catch (e: Exception) {
+            sb.appendLine("Failed to collect logcat: ${e.message}")
         }
         return sb.toString()
     }

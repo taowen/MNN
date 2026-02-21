@@ -17,7 +17,6 @@ import com.alibaba.mnnllm.android.R
 import com.alibaba.mnnllm.android.chat.ChatActivity
 import com.alibaba.mnnllm.android.chat.input.AttachmentPickerModule.AttachmentType
 import com.alibaba.mnnllm.android.chat.input.AttachmentPickerModule.ImagePickCallback
-import com.alibaba.mnnllm.android.chat.ChatActivity.Companion.TAG
 import com.alibaba.mnnllm.android.chat.input.VoiceRecordingModule.VoiceRecordingListener
 import com.alibaba.mnnllm.android.chat.chatlist.ChatViewHolders
 import com.alibaba.mnnllm.android.chat.model.ChatDataItem
@@ -51,14 +50,29 @@ class ChatInputComponent(
     private var buttonSwitchVoice: View? = null
 
     init {
-        buttonSend.setEnabled(false)
-        buttonSend.setOnClickListener { handleSendClick() }
-        setupEditText()
-        setupAttachmentPickerModule()
-        setupVoiceRecordingModule()
-        setupThinkingMode()
-        setupToggleAudioOutput()
-        updateAudioOutput()
+        Log.w(TAG, "init: START")
+        try {
+            buttonSend.setEnabled(false)
+            buttonSend.setOnClickListener { handleSendClick() }
+            Log.w(TAG, "init: setupEditText")
+            setupEditText()
+            Log.w(TAG, "init: setupAttachmentPickerModule")
+            setupAttachmentPickerModule()
+            Log.w(TAG, "init: setupVoiceRecordingModule")
+            setupVoiceRecordingModule()
+            Log.w(TAG, "init: setupThinkingMode")
+            setupThinkingMode()
+            Log.w(TAG, "init: setupToggleAudioOutput")
+            setupToggleAudioOutput()
+            updateAudioOutput()
+            Log.w(TAG, "init: DONE")
+        } catch (e: Exception) {
+            Log.e(TAG, "init: FAILED", e)
+        }
+    }
+
+    companion object {
+        private const val TAG = "ChatInputComponent"
     }
 
     /**
@@ -223,13 +237,20 @@ class ChatInputComponent(
     }
 
     private fun setupAttachmentPickerModule() {
+        Log.w(TAG, "setupAttachmentPickerModule: START currentModelId=$currentModelId")
         imageMore = binding.btPlus
         buttonSwitchVoice = binding.btSwitchAudio
-        if (!ModelTypeUtils.isVisualModel(currentModelId) && !ModelTypeUtils.isAudioModel(currentModelId)) {
+        val isVisual = ModelTypeUtils.isVisualModel(currentModelId)
+        val isAudio = ModelTypeUtils.isAudioModel(currentModelId)
+        Log.w(TAG, "setupAttachmentPickerModule: isVisual=$isVisual isAudio=$isAudio")
+        if (!isVisual && !isAudio) {
             imageMore.setVisibility(View.GONE)
+            Log.w(TAG, "setupAttachmentPickerModule: not visual/audio, returning early")
             return
         }
+        Log.w(TAG, "setupAttachmentPickerModule: creating AttachmentPickerModule")
         attachmentPickerModule = AttachmentPickerModule(chatActivity)
+        Log.w(TAG, "setupAttachmentPickerModule: AttachmentPickerModule created")
         attachmentPickerModule!!.setOnImagePickCallback(object : ImagePickCallback {
             override fun onAttachmentPicked(imageUris: List<Uri>?, audio: AttachmentType?) {
                 imageMore.setVisibility(View.GONE)

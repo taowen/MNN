@@ -106,13 +106,18 @@ data class ModelConfig(
                 val json = file.readText()
                 Gson().fromJson(json, ModelConfig::class.java)
             } catch (e: Exception) {
-                e.printStackTrace()
+                Log.e(TAG, "loadDefaultConfig failed for $filePath", e)
                 null
             }
         }
 
         fun loadConfig(modelId: String): ModelConfig? {
-            return loadMergedConfig(getDefaultConfigFile(modelId)!!, getExtraConfigFile(modelId))
+            val configFile = getDefaultConfigFile(modelId)
+            if (configFile == null) {
+                Log.w(TAG, "loadConfig: no default config file for modelId=$modelId")
+                return null
+            }
+            return loadMergedConfig(configFile, getExtraConfigFile(modelId))
         }
 
         fun loadMergedConfig(originalFilePath: String, overrideFilePath: String): ModelConfig? {
@@ -127,7 +132,7 @@ data class ModelConfig(
                 }
                 Gson().fromJson(originalJson, ModelConfig::class.java)
             } catch (e: Exception) {
-                e.printStackTrace()
+                Log.e(TAG, "loadMergedConfig failed for $originalFilePath", e)
                 null
             }
         }

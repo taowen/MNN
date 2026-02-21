@@ -351,7 +351,13 @@
     <string name="tts_test_description">测试文本转语音功能</string>
     <string name="debug_settings_title">调试设置</string>
     <string name="debug_settings_description">配置调试模式设置和首选项</string>
-    
+    <string name="llm_test_title">LLM 测试</string>
+    <string name="llm_test_description">直接测试 LLM 会话，绕过 ChatActivity</string>
+    <string name="llm_test_config_path_hint">配置路径（如 /data/local/tmp/mnn_models/…/config.json）</string>
+    <string name="llm_test_load_model">加载模型</string>
+    <string name="llm_test_send">发送</string>
+    <string name="llm_test_prompt_hint">输入提示词</string>
+
     <!-- Voice Chat Strings -->
     <string name="voice_chat">语音聊天</string>
     <string name="voice_chat_title">语音聊天 - %1$s</string>

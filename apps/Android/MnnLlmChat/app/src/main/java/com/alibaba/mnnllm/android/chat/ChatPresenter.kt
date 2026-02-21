@@ -117,18 +117,22 @@ class ChatPresenter(
     }
 
     fun load() {
-        Log.d(TAG, "current SessionId: $sessionId")
+        Log.w(TAG, "load: starting model load for sessionId=$sessionId")
         presenterScope.launch {
-            Log.d(TAG, "chatSession loading")
+            Log.w(TAG, "load: coroutine started, calling onLoadingChanged(true)")
             chatActivity.lifecycleScope.launch {
                 chatActivity.onLoadingChanged(true)
             }
-            chatSession.load()
-
+            try {
+                chatSession.load()
+                Log.w(TAG, "load: chatSession.load() completed successfully")
+            } catch (e: Exception) {
+                Log.e(TAG, "load: chatSession.load() failed", e)
+            }
             chatActivity.lifecycleScope.launch {
                 chatActivity.onLoadingChanged(false)
             }
-            Log.d(TAG, "chatSession loaded")
+            Log.w(TAG, "load: done, onLoadingChanged(false) posted")
         }
     }
 

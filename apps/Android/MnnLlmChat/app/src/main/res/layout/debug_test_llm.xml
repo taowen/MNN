@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/llm_test_title"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:layout_marginBottom="16dp" />
+
+    <EditText
+        android:id="@+id/llmConfigPathInput"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="@string/llm_test_config_path_hint"
+        android:text="/data/local/tmp/mnn_models/Fun-Audio-Chat/config.json"
+        android:inputType="text"
+        android:singleLine="true"
+        android:layout_marginBottom="8dp" />
+
+    <Button
+        android:id="@+id/llmLoadButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/llm_test_load_model"
+        android:layout_marginBottom="16dp" />
+
+    <EditText
+        android:id="@+id/llmPromptInput"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="@string/llm_test_prompt_hint"
+        android:inputType="textMultiLine"
+        android:minLines="2"
+        android:maxLines="4"
+        android:enabled="false"
+        android:layout_marginBottom="8dp" />
+
+    <Button
+        android:id="@+id/llmSendButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/llm_test_send"
+        android:enabled="false"
+        android:layout_marginBottom="16dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/llm_test_description"
+        android:textSize="14sp"
+        android:gravity="center"
+        android:layout_marginBottom="16dp" />
+
+</LinearLayout>

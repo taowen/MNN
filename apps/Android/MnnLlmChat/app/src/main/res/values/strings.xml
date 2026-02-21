@@ -360,7 +360,13 @@
     <string name="tts_test_description">Test Text-to-Speech functionality</string>
     <string name="debug_settings_title">Debug Settings</string>
     <string name="debug_settings_description">Configure debug mode settings and preferences</string>
-    
+    <string name="llm_test_title">LLM Test</string>
+    <string name="llm_test_description">Test LLM session directly, bypassing ChatActivity</string>
+    <string name="llm_test_config_path_hint">Config path (e.g. /data/local/tmp/mnn_models/…/config.json)</string>
+    <string name="llm_test_load_model">Load Model</string>
+    <string name="llm_test_send">Send</string>
+    <string name="llm_test_prompt_hint">Enter prompt</string>
+
     <!-- Voice Chat Strings -->
     <string name="voice_chat">Voice Chat</string>
     <string name="voice_chat_title">Voice Chat - %1$s</string>

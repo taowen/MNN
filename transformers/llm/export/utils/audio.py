@@ -187,6 +187,7 @@ class Qwen2_5OmniAudio(Qwen2Audio):
     def __init__(self, audio, base):
         super().__init__(audio, base)
         self.quant_bit = 4
+        self.llm_config['audio_pad'] = self.audio_pad_id
 
     def load(self):
         # config
@@ -277,6 +278,7 @@ class FunAudioChatAudio(Qwen2_5OmniAudio):
     def __init__(self, audio, base):
         super().__init__(audio, base)
         self.audio_pad_id = 151669
+        self.llm_config['audio_pad'] = self.audio_pad_id
 
     def load(self):
         # model

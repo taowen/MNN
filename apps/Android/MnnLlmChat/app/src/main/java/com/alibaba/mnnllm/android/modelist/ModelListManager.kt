@@ -29,7 +29,6 @@ import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -429,29 +428,12 @@ object ModelListManager {
      * Uses Flow-based cache for immediate access
      */
     fun getModelTags(modelId: String): List<String> {
-        // First check memory map for immediate access
         val modelItem = modelIdModelMap[modelId]
         if (modelItem != null) {
             return modelItem.getTags()
         }
-        
-        // If not in memory, wait for first successful state
-        return try {
-            val successState: ModelListState.Success = runBlocking {
-                modelListState
-                    .filterIsInstance<ModelListState.Success>()
-                    .first()
-            }
-            
-            // Find the model in the success state
-            val wrapper: ModelItemWrapper? = successState.models.find { wrapper: ModelItemWrapper -> 
-                wrapper.modelItem.modelId == modelId 
-            }
-            wrapper?.modelItem?.getTags() ?: emptyList()
-        } catch (e: Exception) {
-            Timber.w(e, "Failed to get model tags for $modelId")
-            emptyList()
-        }
+        // Don't block — return empty if model not yet in memory map
+        return emptyList()
     }
 
     /**
