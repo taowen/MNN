@@ -748,6 +748,15 @@ std::vector<int> Omni::audioProcessConv2d(MNN::Express::VARP waveform) {
 #ifdef LLM_SUPPORT_AUDIO
     Timer _t;
     auto input_features = MNN::AUDIO::whisper_fbank(waveform);
+#ifdef DEBUG_AUDIO
+    input_features.fix(MNN::Express::VARP::CONSTANT);
+    input_features->setName("mel_features");
+    MNN::Express::Variable::save({input_features}, "mel_features.mnn");
+    MNN_PRINT("DEBUG_AUDIO: saved mel_features.mnn, shape=[%d, %d, %d]\n",
+              input_features->getInfo()->dim[0],
+              input_features->getInfo()->dim[1],
+              input_features->getInfo()->dim[2]);
+#endif
     int T = input_features->getInfo()->dim[2];
 
     int audio_chunk_len = mConfig->config_.value("audio_chunk_len", 100);
@@ -791,6 +800,18 @@ std::vector<int> Omni::audioProcessConv2d(MNN::Express::VARP waveform) {
     }
 
     auto audio_embedding = mAudioModule->onForward({input_features, attention_mask})[0];
+#ifdef DEBUG_AUDIO
+    {
+        auto embed_copy = _Clone(audio_embedding, true);
+        embed_copy.fix(MNN::Express::VARP::CONSTANT);
+        embed_copy->setName("audio_embed");
+        MNN::Express::Variable::save({embed_copy}, "audio_embed.mnn");
+        MNN_PRINT("DEBUG_AUDIO: saved audio_embed.mnn, shape=[%d, %d, %d]\n",
+                  audio_embedding->getInfo()->dim[0],
+                  audio_embedding->getInfo()->dim[1],
+                  audio_embedding->getInfo()->dim[2]);
+    }
+#endif
     audio_embedding = _Permute(audio_embedding, {1, 0, 2});
     mContext->audio_us = _t.durationInUs();
     mAudioEmbeddings.push_back(audio_embedding);

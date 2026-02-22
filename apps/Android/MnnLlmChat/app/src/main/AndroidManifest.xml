@@ -153,6 +153,11 @@
             android:exported="false"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen" />
 
+        <activity
+            android:name=".test.HeadlessAsrTestActivity"
+            android:exported="true"
+            android:theme="@style/AppTheme" />
+
     </application>
 
 </manifest>

@@ -754,6 +754,10 @@ Module* PipelineModule::load(const std::vector<std::string>& inputs, const std::
     auto& rt = modRuntime.rt->getInside()->mRuntime;
     auto firstRt = rt.first.find(modRuntime.compute.type)->second;
     sharedConst->constReplaceBackend.reset(firstRt->onCreate(modRuntime.userConfig));
+    if (sharedConst->constReplaceBackend.get() == nullptr) {
+        MNN_ERROR("PipelineModule: Failed to create backend for type %d, fallback to default\n", modRuntime.compute.type);
+        sharedConst->constReplaceBackend = sharedConst->defaultBackend;
+    }
     ErrorCode code = NO_ERROR;
     std::set<int> noneedComputeIndexes;
     {

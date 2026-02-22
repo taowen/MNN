@@ -322,6 +322,11 @@ Executor::RuntimeManager* Executor::RuntimeManager::createRuntimeManager(const S
         }
     }
     auto rt = glo->_getOrCreateRuntime(type, config.backendConfig, numThread, false);
+    if (nullptr == rt && type != MNN_FORWARD_CPU) {
+        MNN_ERROR("Failed to create runtime for type %d, falling back to CPU\n", type);
+        type = MNN_FORWARD_CPU;
+        rt = originRt.second;
+    }
     res->mInside->mRuntime.second = originRt.second;
     res->mInside->mRuntime.first.insert(std::make_pair(type, rt));
     res->mInside->mInfo = rt;

@@ -51,6 +51,9 @@ void ArGeneration::generate(GenerationParams& param) {
         mContext->current_token = mLlm->sample(param.outputs[0], param.validLogitStart, param.validLogitSize);
         mContext->history_tokens.push_back(mContext->current_token);
         mContext->output_tokens.push_back(mContext->current_token);
+#ifdef DEBUG_AUDIO
+        MNN_PRINT("DEBUG_AUDIO: token[%d] = %d\n", len, mContext->current_token);
+#endif
         mLlm->updateContext(0, 1);
         if (mLlm->is_stop(mContext->current_token)) {
             if (nullptr != mContext->os) {
