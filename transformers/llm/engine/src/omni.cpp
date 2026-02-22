@@ -69,7 +69,9 @@ Omni::Omni(std::shared_ptr<LlmConfig> config) : Llm(config) {
         mVisionMaxSize = config->config_.value("image_max_size", mVisionMaxSize);
         mVisionGlobal = config->config_.value("global_image", mVisionGlobal);
     }
-    if (config->is_audio()) {}
+    if (config->is_audio()) {
+        mAudioPad = config->config_.value("audio_pad", mAudioPad);
+    }
 }
 
 bool Omni::load() {
@@ -685,12 +687,19 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
         return std::vector<int>(0);
     }
 
+    // Check if this is a Conv2d chunked model (e.g. Qwen3-ASR)
+    int audio_chunk_len = mConfig->config_.value("audio_chunk_len", 0);
+    int audio_tokens_per_chunk = mConfig->config_.value("audio_tokens_per_chunk", 0);
+    if (audio_chunk_len > 0 && audio_tokens_per_chunk > 0) {
+        return audioProcessConv2d(waveform);
+    }
+
     Timer _t;
     auto input_features  = MNN::AUDIO::whisper_fbank(waveform);
     VARP audio_embedding;
     if (mAudioModule->getInfo()->inputNames.size() > 1) {
         int seqlen = UP_DIV(input_features->getInfo()->dim[2], 2);
-        constexpr int n_window = 100;
+        int n_window = mConfig->config_.value("n_window", 100);
         std::vector<int> cu_seqlens;
         int curseq = 0;
         while (curseq < seqlen) {
@@ -723,6 +732,65 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
         audio_embedding = mAudioModule->forward(input_features);
     }
 
+    audio_embedding = _Permute(audio_embedding, {1, 0, 2});
+    mContext->audio_us = _t.durationInUs();
+    mAudioEmbeddings.push_back(audio_embedding);
+    int embed_len = audio_embedding->getInfo()->dim[0];
+    addPositionIds(embed_len);
+    std::vector<int> audio_ids(embed_len, mAudioPad);
+    return audio_ids;
+#else
+    return std::vector<int>(0);
+#endif
+}
+
+std::vector<int> Omni::audioProcessConv2d(MNN::Express::VARP waveform) {
+#ifdef LLM_SUPPORT_AUDIO
+    Timer _t;
+    auto input_features = MNN::AUDIO::whisper_fbank(waveform);
+    int T = input_features->getInfo()->dim[2];
+
+    int audio_chunk_len = mConfig->config_.value("audio_chunk_len", 100);
+    int audio_tokens_per_chunk = mConfig->config_.value("audio_tokens_per_chunk", 13);
+    int n_window = mConfig->config_.value("n_window", 104);
+
+    // Pad T to a multiple of audio_chunk_len
+    int padded_T = UP_DIV(T, audio_chunk_len) * audio_chunk_len;
+    if (padded_T > T) {
+        input_features = _Pad(input_features,
+            _var<int>({0, 0, 0, 0, 0, padded_T - T}, {6}), CONSTANT);
+    }
+
+    // Compute token-space sequence length
+    int seqlen = (padded_T / audio_chunk_len) * audio_tokens_per_chunk;
+
+    // Build windowed attention mask
+    std::vector<int> cu_seqlens;
+    int curseq = 0;
+    while (curseq < seqlen) {
+        cu_seqlens.push_back(curseq);
+        curseq += n_window;
+    }
+    if (seqlen % n_window != 0) {
+        cu_seqlens.push_back(seqlen);
+    }
+
+    VARP attention_mask = _Input({1, seqlen, seqlen}, NCHW, halide_type_of<float>());
+    auto ptr = attention_mask->writeMap<float>();
+    for (int i = 0; i < seqlen; i++) {
+        for (int j = 0; j < seqlen; j++) {
+            ptr[seqlen * i + j] = std::numeric_limits<float>::lowest();
+        }
+    }
+    for (size_t i = 1; i < cu_seqlens.size(); ++i) {
+        for (int j = cu_seqlens[i - 1]; j < cu_seqlens[i]; ++j) {
+            for (int k = cu_seqlens[i - 1]; k < cu_seqlens[i]; ++k) {
+                ptr[seqlen * j + k] = 0;
+            }
+        }
+    }
+
+    auto audio_embedding = mAudioModule->onForward({input_features, attention_mask})[0];
     audio_embedding = _Permute(audio_embedding, {1, 0, 2});
     mContext->audio_us = _t.durationInUs();
     mAudioEmbeddings.push_back(audio_embedding);

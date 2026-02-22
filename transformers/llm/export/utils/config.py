@@ -30,6 +30,7 @@ class LlmConfig(PretrainedConfig):
     def _register_external_model(model_type: str):
         EXTERNAL_MODEL_REGISTRY = {
             'funaudiochat': ('funaudiochat.register', 'register_funaudiochat'),
+            'qwen3_asr': ('utils.register_qwen3_asr', 'register_qwen3_asr'),
         }
         if model_type in EXTERNAL_MODEL_REGISTRY:
             module_path, func_name = EXTERNAL_MODEL_REGISTRY[model_type]

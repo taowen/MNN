@@ -102,6 +102,8 @@ public:
         mVisionModule.reset();
         mAudioModule.reset();
     }
+    // audio processing for models with Conv2d chunked encoder (e.g. Qwen3-ASR)
+    std::vector<int> audioProcessConv2d(MNN::Express::VARP waveform);
     virtual bool load() override;
     virtual std::vector<Express::VARP> forwardRaw(Express::VARP hiddenState, Express::VARP mask, Express::VARP inputPos, Express::VARPS extraArgs) override;
     virtual std::vector<int> tokenizer_encode(const std::string& query) override;

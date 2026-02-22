@@ -88,9 +88,24 @@ class LlmExporter(torch.nn.Module):
         self.llm_config.update(self.model.get_config())
         if self.config.sliding_window > 0:
             self.llm_config['sliding_window'] = self.config.sliding_window
-        if hasattr(self.tokenizer, 'get_chat_template'):
-             chat_template = self.tokenizer.get_chat_template()
-             if chat_template is not None:
+        # Set chat template if not already provided by model/audio config
+        if 'jinja' not in self.llm_config:
+            chat_template = None
+            if hasattr(self.tokenizer, 'get_chat_template'):
+                 try:
+                     chat_template = self.tokenizer.get_chat_template()
+                 except (ValueError, AttributeError):
+                     pass
+            # Fallback: try loading from chat_template.json in model directory
+            if chat_template is None:
+                import os
+                ct_path = os.path.join(model_path, 'chat_template.json')
+                if os.path.exists(ct_path):
+                    import json as _json
+                    with open(ct_path, 'r') as _f:
+                        ct_data = _json.load(_f)
+                        chat_template = ct_data.get('chat_template', None)
+            if chat_template is not None:
                  self.llm_config['jinja'] = {
                      'chat_template': chat_template
                  }

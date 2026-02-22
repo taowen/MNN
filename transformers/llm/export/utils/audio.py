@@ -27,6 +27,7 @@ class Audio(torch.nn.Module):
             'qwen2_audio_encoder': Qwen2Audio,
             'qwen2_5_omni_audio_encoder': Qwen2_5OmniAudio,
             'funaudiochat_audio_encoder': FunAudioChatAudio,
+            'qwen3_asr_audio_encoder': Qwen3ASRAudio,
         }
         if model_type in audio_models:
             return audio_models[model_type]
@@ -302,3 +303,188 @@ class FunAudioChatAudio(Qwen2_5OmniAudio):
         audio_features = audio_features.mean(dim=2)
         audio_features = self.audio_tower.continual_output_matching(audio_features)
         return audio_features
+
+class Qwen3ASRAudio(Qwen2_5OmniAudio):
+    def __init__(self, audio, base):
+        super().__init__(audio, base)
+        # Override audio_pad_id after parent __init__ sets it to 151646
+        thinker_config = self.config.thinker_config
+        self.audio_pad_id = thinker_config.audio_token_id  # 151676
+        self.quant_bit = 4
+
+    def load(self):
+        config = self.audio.config
+        self.n_window = config.n_window  # 50 (mel frame half-chunks)
+        n_window_infer = config.n_window_infer  # 800
+        self.chunk_len = self.n_window * 2  # 100 mel frames per chunk
+        # After Conv2d: each chunk of 100 frames produces 13 tokens
+        self.tokens_per_chunk = 13
+        # Attention window in token space
+        self.window_aftercnn = self.tokens_per_chunk * (n_window_infer // self.chunk_len)  # 104
+
+        self.hidden_size = config.d_model  # 896
+        self.num_attention_heads = config.encoder_attention_heads  # 14
+        self.num_key_value_heads = self.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.rotary = None
+
+        # LLM config for C++ inference
+        thinker_config = self.config.thinker_config
+        self.llm_config['is_audio'] = True
+        self.llm_config['n_window'] = self.window_aftercnn
+        self.llm_config['audio_pad'] = thinker_config.audio_token_id
+        self.llm_config['audio_chunk_len'] = self.chunk_len
+        self.llm_config['audio_tokens_per_chunk'] = self.tokens_per_chunk
+        # MNN-compatible chat template: wraps user content with audio markers
+        # The original HF template expects structured content objects, but MNN
+        # uses <audio> text tags which get replaced by tokenizer_encode
+        self.llm_config['jinja'] = {
+            'chat_template': (
+                "{%- for message in messages -%}"
+                "{%- if message.role == 'system' -%}"
+                "{{ '<|im_start|>system\\n' + message.content + '<|im_end|>\\n' }}"
+                "{%- elif message.role == 'user' -%}"
+                "{{ '<|im_start|>user\\n<|audio_start|>' + message.content + '<|audio_end|><|im_end|>\\n' }}"
+                "{%- elif message.role == 'assistant' -%}"
+                "{{ '<|im_start|>assistant\\n' + message.content + '<|im_end|>\\n' }}"
+                "{%- endif -%}"
+                "{%- endfor -%}"
+                "{%- if add_generation_prompt -%}"
+                "{{ '<|im_start|>assistant\\n' }}"
+                "{%- endif -%}"
+            ),
+            'eos': '<|im_end|>'
+        }
+
+        # Decoder blocks (same layer structure as Qwen2.5-Omni audio)
+        self.model_map = {
+            'decoder': {
+                'self_attn': 'self_attn',
+                'input_layernorm': 'self_attn_layer_norm',
+                'post_attention_layernorm': 'final_layer_norm'
+            },
+            'attention': {
+                'q_proj': 'q_proj',
+                'k_proj': 'k_proj',
+                'v_proj': 'v_proj',
+                'o_proj': 'out_proj'
+            }
+        }
+        self.blocks = []
+        for layer in self.audio.layers:
+            layer_id = len(self.blocks)
+            block = Decoder(layer, layer_id, self)
+            block.mlp = AudioMlp(layer.fc1, layer.fc2, layer.activation_fn)
+            self.blocks.append(block)
+
+    def forward(self, input_features, attention_mask=None):
+        # input_features: [1, 128, T] where T must be a multiple of chunk_len
+        dtype = self.audio.conv2d1.weight.dtype
+        device = self.audio.conv2d1.weight.device
+        input_features = input_features.to(dtype=dtype, device=device)
+
+        # Reshape into chunks: [1, 128, T] -> [N, 1, 128, chunk_len]
+        x = input_features.reshape(1, self.feature_size, -1, self.chunk_len)  # [1, 128, N, chunk_len]
+        x = x.permute(2, 0, 1, 3)  # [N, 1, 128, chunk_len]
+
+        # Conv2d layers (stride=2 each, reducing both mel and time dims by 2x)
+        x = torch.nn.functional.gelu(self.audio.conv2d1(x))
+        x = torch.nn.functional.gelu(self.audio.conv2d2(x))
+        x = torch.nn.functional.gelu(self.audio.conv2d3(x))
+
+        # Reshape: [N, C, F, tokens_per_chunk] -> [N, tokens_per_chunk, C*F]
+        b, c, f, t = x.size()
+        x = x.permute(0, 3, 1, 2).contiguous().reshape(b, t, c * f)
+        x = self.audio.conv_out(x)
+
+        # Add sinusoidal position embedding (per-chunk, same for all chunks)
+        pos_embed = self.audio.positional_embedding.positional_embedding[:t, :].unsqueeze(0)
+        x = x + pos_embed
+
+        # Flatten: [N, tokens_per_chunk, d_model] -> [1, N*tokens_per_chunk, d_model]
+        hidden_states = x.reshape(1, -1, self.hidden_size)
+
+        # Transformer layers with windowed attention mask
+        for block in self.blocks:
+            hidden_states = block(hidden_states, attention_mask=attention_mask)
+
+        # Post-processing: ln_post -> proj1 -> GELU -> proj2
+        hidden_states = self.audio.ln_post(hidden_states)
+        hidden_states = self.audio.proj1(hidden_states)
+        hidden_states = self.audio.act(hidden_states)
+        hidden_states = self.audio.proj2(hidden_states)
+
+        return hidden_states
+
+    def audio_process(self, audio_obj):
+        waveform = torch.from_numpy(audio_obj).type(torch.float32)
+        input_features = self._torch_extract_fbank_features(waveform).unsqueeze(0)
+        _, _, T = input_features.shape
+
+        # Pad T to a multiple of chunk_len
+        padded_T = ((T + self.chunk_len - 1) // self.chunk_len) * self.chunk_len
+        if padded_T > T:
+            input_features = torch.nn.functional.pad(input_features, (0, padded_T - T))
+
+        # Compute token-space sequence length
+        seq_len = (padded_T // self.chunk_len) * self.tokens_per_chunk
+
+        # Build windowed attention mask
+        cu_seqlens = list(range(0, seq_len, self.window_aftercnn))
+        if seq_len % self.window_aftercnn != 0:
+            cu_seqlens.append(seq_len)
+        attention_mask = torch.full(
+            [1, seq_len, seq_len], torch.finfo(torch.float32).min
+        )
+        for i in range(1, len(cu_seqlens)):
+            attention_mask[..., cu_seqlens[i - 1]:cu_seqlens[i], cu_seqlens[i - 1]:cu_seqlens[i]] = 0
+
+        audio_embeds = self.forward(input_features, attention_mask)
+        self.audio_embeds = audio_embeds.permute([1, 0, 2])
+        return self.audio_embeds.shape[0]
+
+    def str_to_ids(self, prompt):
+        if '<audio>' in prompt and '</audio>' in prompt:
+            import re
+            from io import BytesIO
+            from urllib.request import urlopen
+            import librosa
+            pattern = r'(<audio>.*?</audio>)'
+            parts = re.split(pattern, prompt)
+            txt_prompt = ''
+            for part in parts:
+                if re.match(pattern, part):
+                    audio_content = re.search(r'<audio>(.*?)</audio>', part).group(1)
+                    if audio_content.startswith('http://') or audio_content.startswith('https://'):
+                        audio_obj = librosa.load(BytesIO(urlopen(audio_content).read()), sr=self.sampling_rate)[0]
+                    else:
+                        audio_obj = librosa.load(audio_content, sr=self.sampling_rate)[0]
+                    audio_embed_len = self.audio_process(audio_obj)
+                    audio_pad_str = '<|audio_pad|>' * audio_embed_len
+                    txt_prompt += audio_pad_str
+                else:
+                    txt_prompt += part
+        else:
+            txt_prompt = prompt
+        input_ids = self.tokenizer(txt_prompt, return_tensors="pt")['input_ids']
+        return input_ids
+
+    @spinner_run(f'export audio to ')
+    def export(self, onnx_path):
+        # Use multiple chunks for tracing to ensure dynamic shapes work
+        num_chunks = 3
+        input_features = torch.randn((1, self.feature_size, self.chunk_len * num_chunks))
+        seq_len = self.tokens_per_chunk * num_chunks
+        attention_mask = torch.zeros([1, seq_len, seq_len])
+        model = self.float()
+        onnx_model = f'{onnx_path}/audio.onnx'
+        onnx_export(model, (input_features, attention_mask),
+                    onnx_model,
+                    input_names=['input_features', 'attention_mask'],
+                    output_names=['audio_embeds'],
+                    dynamic_axes={"input_features": {
+                        2: "time"
+                    }, "attention_mask": {
+                        1: "seq_len", 2: "seq_len"
+                    }})
+        return onnx_model
