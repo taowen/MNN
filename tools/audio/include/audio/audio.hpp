@@ -56,6 +56,9 @@ struct SpectrogramParams {
     /** Type of window function, default is Hann window (HANNING). */
     int window_type = HANNING;
 
+    /** Whether to use periodic window (for Whisper compatibility), default is false. */
+    bool periodic = false;
+
     /** Constant padding value on the left side of the input audio, default is 0. */
     int pad_left = 0;
 

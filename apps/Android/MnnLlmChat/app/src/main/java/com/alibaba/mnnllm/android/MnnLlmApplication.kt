@@ -5,6 +5,7 @@ package com.alibaba.mnnllm.android
 import android.app.Application
 import com.facebook.stetho.Stetho
 import com.facebook.stetho.dumpapp.DumperPlugin
+import com.alibaba.mnnllm.android.debug.DebugServer
 import com.alibaba.mnnllm.android.debug.ModelListDumperPlugin
 import com.alibaba.mnnllm.android.debug.LoggerDumperPlugin
 import com.alibaba.mls.api.ApplicationProvider
@@ -35,6 +36,9 @@ class MnnLlmApplication : Application() {
         ModelListManager.setContext(getInstance())
 
         if (BuildConfig.DEBUG) {
+            TimberConfig.setFileLoggingEnabled(true)
+            DebugServer.start(this)
+
             val initializer = Stetho.newInitializerBuilder(this)
                 .enableDumpapp {
                     Stetho.DefaultDumperPluginsBuilder(this)

@@ -69,7 +69,11 @@ Omni::Omni(std::shared_ptr<LlmConfig> config) : Llm(config) {
         mVisionMaxSize = config->config_.value("image_max_size", mVisionMaxSize);
         mVisionGlobal = config->config_.value("global_image", mVisionGlobal);
     }
-    if (config->is_audio()) {}
+    if (config->is_audio()) {
+        mAudioPad = config->config_.value("audio_pad", mAudioPad);
+        mNWindow = config->config_.value("n_window", mNWindow);
+        mNWindowInfer = config->config_.value("n_window_infer", mNWindowInfer);
+    }
 }
 
 bool Omni::load() {
@@ -689,15 +693,37 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
     auto input_features  = MNN::AUDIO::whisper_fbank(waveform);
     VARP audio_embedding;
     if (mAudioModule->getInfo()->inputNames.size() > 1) {
-        int seqlen = UP_DIV(input_features->getInfo()->dim[2], 2);
-        constexpr int n_window = 100;
+        int T = input_features->getInfo()->dim[2];
+        int seqlen, n_window_tokens;
+        if (mNWindowInfer > 0) {
+            // Qwen3-ASR style: Conv2D per-chunk with 8x downsampling
+            int chunk_frames = mNWindow * 2;
+            // Pad T to multiple of chunk_frames
+            if (T % chunk_frames != 0) {
+                int pad = chunk_frames - (T % chunk_frames);
+                auto zeros = Express::_Const(0.0f, {1, input_features->getInfo()->dim[1], pad}, NCHW);
+                input_features = Express::_Concat({input_features, zeros}, 2);
+                T += pad;
+            }
+            int n_chunks = T / chunk_frames;
+            int tokens_per_chunk = chunk_frames;
+            for (int i = 0; i < 3; i++) {
+                tokens_per_chunk = (tokens_per_chunk + 1) / 2;
+            }
+            seqlen = n_chunks * tokens_per_chunk;
+            n_window_tokens = tokens_per_chunk * (mNWindowInfer / chunk_frames);
+        } else {
+            // Qwen2.5-Omni style: Conv1D with 2x downsampling
+            seqlen = UP_DIV(T, 2);
+            n_window_tokens = 100;
+        }
         std::vector<int> cu_seqlens;
         int curseq = 0;
         while (curseq < seqlen) {
             cu_seqlens.push_back(curseq);
-            curseq += n_window;
+            curseq += n_window_tokens;
         }
-        if (seqlen % n_window != 0) {
+        if (seqlen % n_window_tokens != 0) {
             cu_seqlens.push_back(seqlen);
         }
         VARP attention_mask = _Input({1, seqlen, seqlen}, NCHW, halide_type_of<float>());

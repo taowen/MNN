@@ -188,7 +188,6 @@ std::string Prompt::applyTemplate(const std::vector<ChatMessage>& inputs, bool a
     for (auto input : inputs) {
         if (input.first == "") continue;
         if (input.first == "system") {
-            if (input.second == "") continue;
             prompt_str += buildPrompt(input, mSystemTemplate, "%s");
             continue;
         } else if (input.first == "user") {

@@ -27,6 +27,7 @@ class Audio(torch.nn.Module):
             'qwen2_audio_encoder': Qwen2Audio,
             'qwen2_5_omni_audio_encoder': Qwen2_5OmniAudio,
             'funaudiochat_audio_encoder': FunAudioChatAudio,
+            'qwen3_asr_audio_encoder': Qwen3AsrAudio,
         }
         if model_type in audio_models:
             return audio_models[model_type]
@@ -302,3 +303,153 @@ class FunAudioChatAudio(Qwen2_5OmniAudio):
         audio_features = audio_features.mean(dim=2)
         audio_features = self.audio_tower.continual_output_matching(audio_features)
         return audio_features
+
+
+class Qwen3AsrAudio(Qwen2_5OmniAudio):
+    """Audio encoder for Qwen3-ASR models.
+
+    Key differences from Qwen2.5-Omni:
+    - Conv2D stem (3 layers, 8x downsample) instead of Conv1D (2 layers, 2x downsample)
+    - Per-chunk convolution: mel is split into chunks of n_window*2 frames
+    - Sinusoidal positional embeddings (per-chunk, computed not stored)
+    - Projection: proj1 (Linear+GELU) + proj2 (Linear) instead of avg_pooler + proj
+    """
+
+    def load(self):
+        self.audio_pad_id = self.config.thinker_config.audio_token_id
+        config = self.audio.config
+        self.n_window = config.n_window
+        self.n_window_infer = getattr(config, 'n_window_infer', 800)
+        self.chunk_frames = self.n_window * 2  # 100 mel frames per conv chunk
+        self.llm_config['is_audio'] = True
+        self.llm_config['audio_pad'] = self.audio_pad_id
+        self.llm_config['n_window'] = self.n_window
+        self.llm_config['n_window_infer'] = self.n_window_infer
+        self.hidden_size = config.d_model
+        self.num_attention_heads = config.encoder_attention_heads
+        self.num_key_value_heads = self.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.output_dim = config.output_dim
+        self.rotary = None
+        self.model_map = {
+            'decoder': {
+                'self_attn': 'self_attn',
+                'input_layernorm': 'self_attn_layer_norm',
+                'post_attention_layernorm': 'final_layer_norm'
+            },
+            'attention': {
+                'q_proj': 'q_proj',
+                'k_proj': 'k_proj',
+                'v_proj': 'v_proj',
+                'o_proj': 'out_proj'
+            }
+        }
+        self.blocks = []
+        for layer in self.audio.layers:
+            layer_id = len(self.blocks)
+            block = Decoder(layer, layer_id, self)
+            block.mlp = AudioMlp(layer.fc1, layer.fc2, layer.activation_fn)
+            self.blocks.append(block)
+
+    def _sinusoidal_embedding(self, length, channels):
+        import math
+        log_timescale_increment = math.log(10000) / (channels // 2 - 1)
+        inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2, dtype=torch.float32))
+        scaled_time = torch.arange(length, dtype=torch.float32).unsqueeze(1) * inv_timescales.unsqueeze(0)
+        return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
+
+    def forward(self, input_features, attention_mask=None):
+        # input_features: [1, 128, T] where T = n_chunks * chunk_frames
+        dtype = self.audio.conv2d1.weight.dtype
+        device = self.audio.conv2d1.weight.device
+        input_features = input_features.to(dtype=dtype, device=device)
+        _, n_mels, total_frames = input_features.shape
+        n_chunks = total_frames // self.chunk_frames
+
+        # Per-chunk Conv2D: split time dim into chunks, then permute
+        # [1, 128, T] -> [1, 128, n_chunks, chunk_frames] -> [n_chunks, 1, 128, chunk_frames]
+        x = input_features.reshape(1, n_mels, -1, self.chunk_frames).permute(2, 0, 1, 3)
+        x = torch.nn.functional.gelu(self.audio.conv2d1(x))
+        x = torch.nn.functional.gelu(self.audio.conv2d2(x))
+        x = torch.nn.functional.gelu(self.audio.conv2d3(x))
+
+        # x: [n_chunks, 480, freq_bins, tokens_per_chunk]
+        b, c, f, t = x.shape
+        x = x.permute(0, 3, 1, 2).reshape(b, t, c * f)  # [n_chunks, t, 7680]
+        x = self.audio.conv_out(x)  # [n_chunks, t, d_model]
+
+        # Per-chunk sinusoidal positional embedding
+        pos_embed = self.audio.positional_embedding.positional_embedding[:t, :]
+        x = x + pos_embed.unsqueeze(0)
+
+        # Flatten to single sequence: [1, n_chunks*t, d_model]
+        x = x.reshape(1, -1, self.hidden_size)
+
+        # Transformer layers with windowed attention mask
+        for block in self.blocks:
+            x = block(x, attention_mask=attention_mask)
+
+        # Output projection: LayerNorm -> proj1 + GELU -> proj2
+        x = self.audio.ln_post(x)
+        x = torch.nn.functional.gelu(self.audio.proj1(x))
+        x = self.audio.proj2(x)
+
+        return x
+
+    def audio_process(self, audio_obj):
+        waveform = torch.from_numpy(audio_obj).type(torch.float32)
+        input_features = self._torch_extract_fbank_features(waveform).unsqueeze(0)
+        _, _, total_frames = input_features.shape
+
+        # Pad to multiple of chunk_frames
+        if total_frames % self.chunk_frames != 0:
+            pad_frames = self.chunk_frames - (total_frames % self.chunk_frames)
+            input_features = torch.nn.functional.pad(input_features, (0, pad_frames))
+            total_frames = input_features.shape[2]
+
+        n_chunks = total_frames // self.chunk_frames
+        # tokens_per_chunk after 3x stride-2 conv on time dim
+        tokens_per_chunk = self.chunk_frames
+        for _ in range(3):
+            tokens_per_chunk = (tokens_per_chunk + 1) // 2
+        seq_len = n_chunks * tokens_per_chunk
+
+        # Windowed attention mask
+        tokens_per_window = tokens_per_chunk * (self.n_window_infer // self.chunk_frames)
+        cu_seqlens = list(range(0, seq_len, tokens_per_window))
+        if seq_len % tokens_per_window != 0:
+            cu_seqlens.append(seq_len)
+        attention_mask = torch.full(
+            [1, seq_len, seq_len], torch.finfo(torch.float32).min
+        )
+        for i in range(1, len(cu_seqlens)):
+            attention_mask[..., cu_seqlens[i - 1]:cu_seqlens[i], cu_seqlens[i - 1]:cu_seqlens[i]] = 0
+
+        audio_embeds = self.forward(input_features, attention_mask)
+        self.audio_embeds = audio_embeds.permute([1, 0, 2])
+        return self.audio_embeds.shape[0]
+
+    @spinner_run(f'export audio to ')
+    def export(self, onnx_path):
+        # Use 30 chunks (3000 mel frames = 30s audio) as trace example
+        n_chunks = 30
+        total_frames = n_chunks * self.chunk_frames
+        tokens_per_chunk = self.chunk_frames
+        for _ in range(3):
+            tokens_per_chunk = (tokens_per_chunk + 1) // 2
+        seq_len = n_chunks * tokens_per_chunk
+
+        input_features = torch.randn((1, self.feature_size, total_frames))
+        attention_mask = torch.randn([1, seq_len, seq_len])
+        model = self.float()
+        onnx_model = f'{onnx_path}/audio.onnx'
+        onnx_export(model, (input_features, attention_mask),
+                    onnx_model,
+                    input_names=['input_features', 'attention_mask'],
+                    output_names=['audio_embeds'],
+                    dynamic_axes={"input_features": {
+                        2: "size"
+                    }, "attention_mask": {
+                        1: "size", 2: "size"
+                    }})
+        return onnx_model

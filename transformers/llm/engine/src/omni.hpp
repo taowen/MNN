@@ -123,6 +123,7 @@ private:
     int mVisionGlobal = 49152;
     int mVisionSizeUnit = 1, mVisionMaxSize = 2048;
     int mVisionNum = 0;
+    int mNWindow = 50, mNWindowInfer = 0;
     std::vector<float> mVisionMean{122.7709383, 116.7460125, 104.09373615};
     std::vector<float> mVisionNorm{0.01459843, 0.01500777, 0.01422007};
     std::vector<int> multimodeProcess(const std::string& mode, std::string info);
