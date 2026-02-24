@@ -375,6 +375,8 @@ datasets/*
 source/backend/qnn/3rdParty/include
 project/android/.cxx
 pymnn/android/.cxx/
+# Android NDK CMake build cache (general)
+**/.cxx/
 apps/mnncli/.cursorrules
 apps/mnncli/model_market_json_data.inc
 #kledi

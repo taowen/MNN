@@ -130,9 +130,13 @@ private:
     mutable std::map<const Tensor::InsideDescribe::NativeInsideDescribe *, std::pair<const Tensor*, std::shared_ptr<Tensor>>> mInputCastTensorMap;
     mutable std::map<const Tensor::InsideDescribe::NativeInsideDescribe *, std::pair<const Tensor*, std::shared_ptr<Tensor>>> mOutputCastTensorMap;
     mutable std::map<const Tensor::InsideDescribe::NativeInsideDescribe *, std::pair<const Tensor*, std::shared_ptr<Tensor>>> mDeQuantOutputTensorMap;
-    std::vector<int> mInputTensorIndexes;
+    mutable std::vector<int> mInputTensorIndexes;
     std::vector<int> mOutputTensorIndexes;
     mutable std::vector<Tensor*> mOutputTensors; // parallel to mOutputTensorIndexes, for host sync
+    // INPUT tensors discovered in getTensorIdx (not via onAcquire) that need
+    // data copied from their host pointer before each graphExecute.
+    // Pairs of (wrapper index for the APP_WRITE data container, original tensor).
+    mutable std::vector<std::pair<int, const Tensor*>> mDeferredInputs;
     std::vector<std::function<void()>> mReleaseFunc;
 
     // Extra I/O tensors managed by individual ops (not through onAcquire)
