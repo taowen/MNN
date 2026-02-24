@@ -30,13 +30,15 @@ class LlmConfig(PretrainedConfig):
     def _register_external_model(model_type: str):
         EXTERNAL_MODEL_REGISTRY = {
             'funaudiochat': ('funaudiochat.register', 'register_funaudiochat'),
+            'qwen3_asr': ('qwen_asr.core.transformers_backend', None),
         }
         if model_type in EXTERNAL_MODEL_REGISTRY:
             module_path, func_name = EXTERNAL_MODEL_REGISTRY[model_type]
             try:
                 import importlib
                 module = importlib.import_module(module_path)
-                getattr(module, func_name)()
+                if func_name is not None:
+                    getattr(module, func_name)()
             except ImportError:
                 raise ImportError(
                     f"{model_type} requires external package. "
@@ -52,7 +54,12 @@ class LlmConfig(PretrainedConfig):
             model_type = raw_config.get('model_type')
             cls._register_external_model(model_type)
 
-        config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True, **kwargs)
+        try:
+            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True, **kwargs)
+        except (ValueError, KeyError):
+            # Fallback for model types not yet in transformers (e.g. qwen3_asr)
+            from transformers import PretrainedConfig
+            config = PretrainedConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True, **kwargs)
 
         model_type, model_map = ModelMapper().get_map(config)
         llm_config_kwargs = {

@@ -392,6 +392,11 @@ void Llm::tuning(TuneType type, std::vector<int> candidates) {
     if (mConfig->backend_type() == "opencl") {
         return;
     }
+    // QNN/NPU: tuning rebuilds the QNN graph with different OP_ENCODER_NUMBER
+    // configs, which causes tensor registration issues during rebuild.
+    if (mConfig->backend_type() == "npu") {
+        return;
+    }
     int decode_seq = 1;
     // Set to decode mode
     mContext->gen_seq_len = 1;

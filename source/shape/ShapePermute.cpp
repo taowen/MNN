@@ -24,7 +24,10 @@ public:
 
         if (nullptr != op->main_as_Permute()->dims()) {
             auto shape  = op->main_as_Permute()->dims();
-            MNN_ASSERT(shape->size() == input->buffer().dimensions);
+            if (shape->size() != input->buffer().dimensions) {
+                MNN_ERROR("Permute: dims size %d != input dimensions %d\n", (int)shape->size(), input->buffer().dimensions);
+                return false;
+            }
             for (int i = 0; i < dimSize; ++i) {
                 output->buffer().dim[i].extent = input->buffer().dim[shape->data()[i]].extent;
             }

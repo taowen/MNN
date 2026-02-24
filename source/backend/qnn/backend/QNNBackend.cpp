@@ -24,6 +24,19 @@
 
 namespace MNN {
 namespace QNN {
+
+// MemObj subclass that frees host memory allocated for QNN output tensors.
+// QNN output tensors need host memory so Tensor::clone() works across sub-modules.
+class QnnHostMemObj : public Backend::MemObj {
+public:
+    QnnHostMemObj(void* ptr) : mPtr(ptr) {}
+    ~QnnHostMemObj() override {
+        if (mPtr) { free(mPtr); mPtr = nullptr; }
+    }
+private:
+    void* mPtr;
+};
+
 struct QnnContext {
     QNN_INTERFACE_VER_TYPE interface{};
     QNN_SYSTEM_INTERFACE_VER_TYPE systemInterface{};
@@ -106,9 +119,42 @@ static void createQnnContext(){
         if (supportDevice) {
             const QnnDevice_Config_t ** deviceConfig = nullptr;
             auto qnnStatus = qnnInterface.deviceCreate(logHandle, deviceConfig, &deviceHandle);
-            if(qnnStatus != QNN_SUCCESS || (deviceHandle == nullptr)) {
-                MNN_PRINT("MNN_QNN: Failed to create the device, error:%lu\n", (unsigned long)qnnStatus);
-                return;
+            if (qnnStatus != QNN_SUCCESS || deviceHandle == nullptr) {
+                // Newer SoCs (e.g. SM8750) require explicit SoC config
+                MNN_PRINT("MNN_QNN: Default device creation failed (error:%lu), retrying with SoC config\n", (unsigned long)qnnStatus);
+                deviceHandle = nullptr;
+
+                QnnHtpDevice_CustomConfig_t htpSocConfig = {};
+                htpSocConfig.option = QNN_HTP_DEVICE_CONFIG_OPTION_SOC;
+                htpSocConfig.socModel = 0;
+
+                // Try known SoC models from newest to oldest
+                static const uint32_t knownSocs[] = {
+                    69,  // SM8750 (Snapdragon 8 Elite, HTP V79)
+                    57,  // SM8650 (Snapdragon 8 Gen 3, HTP V75)
+                    43,  // SM8550 (Snapdragon 8 Gen 2, HTP V73)
+                    36,  // SM8450 (Snapdragon 8 Gen 1, HTP V69)
+                };
+
+                QnnDevice_Config_t socDeviceConfig = QNN_DEVICE_CONFIG_INIT;
+                socDeviceConfig.option = QNN_DEVICE_CONFIG_OPTION_CUSTOM;
+                socDeviceConfig.customConfig = &htpSocConfig;
+                const QnnDevice_Config_t* deviceConfigArray[] = {&socDeviceConfig, nullptr};
+
+                for (uint32_t soc : knownSocs) {
+                    htpSocConfig.socModel = soc;
+                    qnnStatus = qnnInterface.deviceCreate(logHandle, deviceConfigArray, &deviceHandle);
+                    if (qnnStatus == QNN_SUCCESS && deviceHandle != nullptr) {
+                        MNN_PRINT("MNN_QNN: Device created with SoC model %u\n", soc);
+                        break;
+                    }
+                    deviceHandle = nullptr;
+                }
+
+                if (deviceHandle == nullptr) {
+                    MNN_PRINT("MNN_QNN: Failed to create device with any known SoC config, error:%lu\n", (unsigned long)qnnStatus);
+                    return;
+                }
             }
 
             if (qnnInterface.deviceGetPlatformInfo == nullptr) {
@@ -1118,6 +1164,7 @@ bool QnnBackend::addCreator(OpType t, Creator* c) {
 
 
 void QnnBackend::onExecuteBegin() const {
+    mGraphExecuted = false;
     if (mPower == BackendConfig::Power_Normal) {
         mPerf->setPowerConfigBurst();
         mPerf->setRpcLatencyAndPolling();
@@ -1139,25 +1186,37 @@ void QnnBackend::onExecuteEnd() const {
 }
 
 void QnnBackend::onResizeBegin() {
+    MNN_PRINT("QNN onResizeBegin[%p]: cleaning and recreating graph\n", this);
     clean();
     createContextAndGraph();
     return;
 }
 
 ErrorCode QnnBackend::onResizeEnd() {
-    #ifdef QNN_VERBOSE
-    MNN_PRINT("start finalize\n");
-    #endif
+    MNN_PRINT("QNN onResizeEnd[%p]: tensorWrappers=%d outputCastMap=%d dequantMap=%d "
+              "inputIndexes=%d outputIndexes=%d extraInputs=%d extraOutputs=%d\n",
+              this,
+              (int)mQNNTensorWrappers.size(), (int)mOutputCastTensorMap.size(),
+              (int)mDeQuantOutputTensorMap.size(),
+              (int)mInputTensorIndexes.size(), (int)mOutputTensorIndexes.size(),
+              (int)mExtraInputWrappers.size(), (int)mExtraOutputWrappers.size());
+    // Check for entries with missing tensors BEFORE building cast nodes
+    for (auto iter : mOutputCastTensorMap) {
+        int idx1 = getTensorIdx(iter.second.first);
+        int idx2 = getTensorIdx(iter.second.second.get());
+        MNN_PRINT("QNN onResizeEnd: outputCast entry: origIdx=%d stageIdx=%d wrapperTotal=%d\n",
+                  idx1, idx2, (int)mQNNTensorWrappers.size());
+    }
     buildOutputCast();
     buildOutputDequant();
     finalizeGraph();
+    MNN_PRINT("QNN onResizeEnd[%p]: after finalizeGraph, running %d release funcs\n",
+              this, (int)mReleaseFunc.size());
     for(auto func : mReleaseFunc){
         func();
     }
     mReleaseFunc.clear();
-    #ifdef QNN_VERBOSE
-    MNN_PRINT("end finalize\n");
-    #endif
+    MNN_PRINT("QNN onResizeEnd[%p]: done\n", this);
     return NO_ERROR;
 }
 
@@ -1313,6 +1372,15 @@ Backend::MemObj* QnnBackend::onAcquire(const Tensor* tensor, StorageType storage
                 mTensorMap.insert({TensorUtils::getDescribe(const_cast<const Tensor*>(stageTensor.get())), mTensorCounter});
                 mOutputTensorIndexes.push_back(mTensorCounter);
                 qnnCastTensorWrapper->alloc(tensorDimType);
+                MNN_PRINT("QNN onAcquire[%p]: OUTPUT+FP16 cast entry added, origDesc=%p stageDesc=%p "
+                          "origIdx=%d stageIdx=%d shape=[%d",
+                          this, TensorUtils::getDescribe(tensor),
+                          TensorUtils::getDescribe(const_cast<const Tensor*>(stageTensor.get())),
+                          mTensorCounter - 1, mTensorCounter, tensor->shape().empty() ? 0 : tensor->shape()[0]);
+                for (int si = 1; si < (int)tensor->shape().size(); si++) {
+                    MNN_PRINT(",%d", tensor->shape()[si]);
+                }
+                MNN_PRINT("]\n");
             }else{
                 mOutputTensorIndexes.push_back(mTensorCounter);
                 qnnTensorWrapper->alloc(tensorDimType);
@@ -1320,10 +1388,30 @@ Backend::MemObj* QnnBackend::onAcquire(const Tensor* tensor, StorageType storage
         }
     }
 
+    // For OUTPUT tensors, allocate host memory so that Tensor::clone() works
+    // across sub-module boundaries (PipelineModule passes VARPs between
+    // sub-modules, and the receiving StaticModule calls copyFromHostTensor
+    // which reads from the tensor's host pointer).
+    void* hostMem = nullptr;
+    if (isOutput) {
+        auto mutableTensor = const_cast<Tensor*>(tensor);
+        size_t hostSize = (size_t)tensor->elementSize() * tensor->getType().bytes();
+        if (hostSize > 0) {
+            hostMem = calloc(1, hostSize);
+            mutableTensor->buffer().host = (uint8_t*)hostMem;
+            mOutputTensors.push_back(mutableTensor);
+            MNN_PRINT("QNN onAcquire[%p]: allocated %zu bytes host memory for OUTPUT tensor\n",
+                      this, hostSize);
+        }
+    }
+
     mTensorCounter += 1;
     #ifdef QNN_VERBOSE
     MNN_PRINT("Total qnn tensor count:%d\n", mTensorCounter);
     #endif
+    if (hostMem) {
+        return new QnnHostMemObj(hostMem);
+    }
     return new Backend::MemObj();
 }
 
@@ -1344,7 +1432,19 @@ void QnnBackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor) 
         MNN_ASSERT(isInput);
     }
 
-    MNN_ASSERT(isInput || isOutput);
+    if (!isInput && !isOutput && !isConst) {
+        // Intermediate tensor copy (e.g., WrapCopyExecution for mixed pipelines).
+        // Try to determine direction from the tensor map.
+        int srcIdx = getTensorIdx(srcTensor);
+        if (srcIdx >= 0) {
+            // Source is a QNN tensor — treat as output copy (data leaving QNN)
+            outputIO(srcTensor, dstTensor);
+        } else {
+            // Source is external — treat as input copy (data entering QNN)
+            inputIO(srcTensor, dstTensor);
+        }
+        return;
+    }
 
     if (isInput) {
         inputIO(srcTensor, dstTensor);
@@ -1363,6 +1463,11 @@ void QnnBackend::inputIO(const Tensor* srcTensor, const Tensor* dstTensor) const
     } else{
         dstIndex = getTensorIdx(dstTensor);
     }
+    if (dstIndex < 0 || dstIndex >= (int)mQNNTensorWrappers.size()) {
+        MNN_ERROR("QNN inputIO[%p]: invalid dstIndex=%d (total=%d), skipping\n",
+                  this, dstIndex, (int)mQNNTensorWrappers.size());
+        return;
+    }
     std::shared_ptr<QNNTensorWrapper> dstQnnTensorWrapper = mQNNTensorWrappers[dstIndex];
     std::shared_ptr<Tensor> dstDataContainer = dstQnnTensorWrapper->getDataContainer();
 
@@ -1372,8 +1477,30 @@ void QnnBackend::inputIO(const Tensor* srcTensor, const Tensor* dstTensor) const
     // Currently, support float and int input only.
     MNN_ASSERT(valid0 || valid1);
 
+    // Guard against NULL source host pointer.  This can happen when the source
+    // tensor comes from another QnnBackend whose graph was not executed (e.g.,
+    // backup backend with no ops).  The QNN tensor wrapper has its own memory
+    // but the MNN Tensor's host pointer is never set.
+    if (srcTensor->host<void>() == nullptr) {
+        MNN_ERROR("QNN inputIO[%p]: src host is NULL (elemSize=%d), zero-filling dst\n",
+                  this, srcTensor->elementSize());
+        ::memset(dstDataContainer.get()->host<void>(), 0,
+                 srcTensor->elementSize() * srcTensor->getType().bytes());
+        return;
+    }
     if(TensorUtils::getDescribe(srcTensor)->dimensionFormat == TensorUtils::getDescribe(dstDataContainer.get())->dimensionFormat){
         ::memcpy(dstDataContainer.get()->host<float>(), srcTensor->host<float>(), srcTensor->elementSize() * sizeof(float));
+    // Debug: dump first few input values for pipeline-level inputs
+    if (dstIndex < 10) {
+        float* dbg = srcTensor->host<float>();
+        int n = srcTensor->elementSize() < 8 ? srcTensor->elementSize() : 8;
+        char dbgBuf[256];
+        int pos = 0;
+        for (int d = 0; d < n; d++) {
+            pos += snprintf(dbgBuf + pos, sizeof(dbgBuf) - pos, " %.4f", dbg[d]);
+        }
+        MNN_PRINT("QNN inputIO: input[%d] first %d values:%s (total=%d)\n", dstIndex, n, dbgBuf, srcTensor->elementSize());
+    }
     }else{
         auto code = CPUTensorConverter::convert(srcTensor, dstDataContainer.get());
         if (NO_ERROR != code) {
@@ -1383,6 +1510,14 @@ void QnnBackend::inputIO(const Tensor* srcTensor, const Tensor* dstTensor) const
 }
 
 void QnnBackend::outputIO(const Tensor* srcTensor, const Tensor* dstTensor) const {
+    // Lazy graph execution: if the graph hasn't been executed yet (e.g., called
+    // from a WrapCopyExecution mid-pipeline before onExecuteEnd), run it now
+    // so that the QNN data containers have valid output data.
+    if (!mGraphExecuted && mGraphFinalized) {
+        MNN_PRINT("QNN outputIO[%p]: triggering lazy graph execution\n", this);
+        executeGraph();
+    }
+
     auto iter = mDeQuantOutputTensorMap.find(TensorUtils::getDescribe(srcTensor));
     int srcIndex = -1;
     if(iter != mDeQuantOutputTensorMap.end()){
@@ -1400,6 +1535,21 @@ void QnnBackend::outputIO(const Tensor* srcTensor, const Tensor* dstTensor) cons
             srcIndex = getTensorIdx(srcTensor);
         }
     }
+    if (srcIndex < 0 || srcIndex >= (int)mQNNTensorWrappers.size()) {
+        // Source tensor is not in QNN's tensor map — it's from a different
+        // backend (e.g., CPU backup via WrapCopyExecution).  Fall back to
+        // direct host-to-host copy.
+        if (srcTensor->host<void>() != nullptr && dstTensor->host<void>() != nullptr) {
+            size_t bytes = (size_t)srcTensor->elementSize() * srcTensor->getType().bytes();
+            MNN_PRINT("QNN outputIO[%p]: foreign src, host-to-host copy %zu bytes\n", this, bytes);
+            ::memcpy(const_cast<Tensor*>(dstTensor)->host<void>(),
+                     srcTensor->host<void>(), bytes);
+        } else {
+            MNN_ERROR("QNN outputIO[%p]: foreign src with NULL host (src=%p dst=%p), skipping\n",
+                      this, srcTensor->host<void>(), dstTensor->host<void>());
+        }
+        return;
+    }
     std::shared_ptr<QNNTensorWrapper> srcQnnTensorWrapper = mQNNTensorWrappers[srcIndex];
     std::shared_ptr<Tensor> srcDataContainer = srcQnnTensorWrapper->getDataContainer();
 
@@ -1410,6 +1560,11 @@ void QnnBackend::outputIO(const Tensor* srcTensor, const Tensor* dstTensor) cons
     // Currently, support float and int input only.
     MNN_ASSERT(valid0 || valid1);
 
+    // Guard against NULL destination host pointer (same issue as inputIO above)
+    if (dstTensor->host<void>() == nullptr) {
+        MNN_ERROR("QNN outputIO[%p]: dst host is NULL, skipping copy\n", this);
+        return;
+    }
     if(TensorUtils::getDescribe(dstTensor)->dimensionFormat == TensorUtils::getDescribe(srcDataContainer.get())->dimensionFormat){
         ::memcpy(dstTensor->host<float>(), srcDataContainer.get()->host<float>(), srcTensor->elementSize() * sizeof(float));
     }else{
@@ -1424,12 +1579,22 @@ bool QnnBackend::useCache() const {
 }
 
 void QnnBackend::createContextAndGraph() {
-    mRuntime->allocContext();
+    // Each QnnBackend creates its own QNN context so that multiple backends
+    // (main + backup + lm_head, etc.) don't clobber each other's contexts.
+    // Previously all backends shared mRuntime->mQnnContextHandle, which caused
+    // one backend's clean() to invalidate another backend's graph handles.
+    CALL_QNN(mRuntime->mQnnInterface.contextCreate(
+        mRuntime->mQnnBackendHandle, mRuntime->mQnnDeviceHandle,
+        mQnnContextConfig, &mQnnContextHandle));
+    if (mQnnContextHandle == nullptr) {
+        MNN_ERROR("QNN createContextAndGraph[%p]: contextCreate returned null!\n", this);
+        return;
+    }
     const QnnGraph_Config_t * pGraphConfig[] = {&mQnnGraphConfig, nullptr};
     if (mRuntime->mUseCache) {
-        CALL_QNN(mRuntime->mQnnInterface.graphRetrieve(mRuntime->mQnnContextHandle, mQnnGraphName.c_str(), &mQnnGraphHandle));
+        CALL_QNN(mRuntime->mQnnInterface.graphRetrieve(mQnnContextHandle, mQnnGraphName.c_str(), &mQnnGraphHandle));
     } else {
-        CALL_QNN(mRuntime->mQnnInterface.graphCreate(mRuntime->mQnnContextHandle, mQnnGraphName.c_str(), pGraphConfig, &mQnnGraphHandle));
+        CALL_QNN(mRuntime->mQnnInterface.graphCreate(mQnnContextHandle, mQnnGraphName.c_str(), pGraphConfig, &mQnnGraphHandle));
     }
     MNN_ASSERT(mQnnGraphHandle != nullptr);
 }
@@ -1439,34 +1604,111 @@ void QnnBackend::finalizeGraph() {
     if (mTensorCounter == 0) {
         return;
     }
-    #ifdef QNN_VERBOSE
-    MNN_PRINT("Total qnn tensor count:%d\n", mTensorCounter);
-    #endif
+    // Skip finalization for graphs with no inputs - these are typically backup backend
+    // instances that can't form a valid QNN graph.
+    if (mInputTensorIndexes.empty() && mExtraInputWrappers.empty()) {
+        MNN_PRINT("QNN finalizeGraph[%p]: skipping (no inputs), tensorCount=%d\n",
+                  this, mTensorCounter);
+        return;
+    }
+    MNN_PRINT("QNN finalizeGraph[%p]: tensorCount=%d inputs=%d outputs=%d extraInputs=%d extraOutputs=%d\n",
+              this, mTensorCounter, (int)mInputTensorIndexes.size(), (int)mOutputTensorIndexes.size(),
+              (int)mExtraInputWrappers.size(), (int)mExtraOutputWrappers.size());
 
     // Create Prefile Handle
     MNN::QNN::createProfileHandle(mRuntime->mQnnInterface, mRuntime->mQnnBackendHandle, &mQnnProfileHandle);
 
-    CALL_QNN(mRuntime->mQnnInterface.graphFinalize(mQnnGraphHandle, mQnnProfileHandle, mQnnSignalHandle));
+    auto ret = mRuntime->mQnnInterface.graphFinalize(mQnnGraphHandle, mQnnProfileHandle, mQnnSignalHandle);
+    int errorCode = ret & 0xFFFF;
+    if (errorCode != QNN_SUCCESS) {
+        MNN_ERROR("QNN graphFinalize FAILED: error code %d\n", errorCode);
+    } else {
+        MNN_PRINT("QNN graphFinalize SUCCESS\n");
+        mGraphFinalized = true;
+    }
 }
 
 void QnnBackend::executeGraph() const {
+    if (!mGraphFinalized) {
+        MNN_PRINT("QNN executeGraph[%p]: skipping (graph not finalized)\n", this);
+        return;
+    }
+    if (mGraphExecuted) {
+        MNN_PRINT("QNN executeGraph[%p]: skipping (already executed this cycle)\n", this);
+        return;
+    }
     std::vector<Qnn_Tensor_t> inputs;
     std::vector<Qnn_Tensor_t> outputs;
     for (int i = 0; i <  mInputTensorIndexes.size(); i++) {
         inputs.push_back(*(mQNNTensorWrappers[mInputTensorIndexes[i]]->getNativeTensor()));
     }
+    for (auto& wrapper : mExtraInputWrappers) {
+        inputs.push_back(*(wrapper->getNativeTensor()));
+    }
     for (int j = 0 ; j < mOutputTensorIndexes.size(); j++) {
         outputs.push_back(*(mQNNTensorWrappers[mOutputTensorIndexes[j]]->getNativeTensor()));
     }
+    for (auto& wrapper : mExtraOutputWrappers) {
+        outputs.push_back(*(wrapper->getNativeTensor()));
+    }
 
-    CALL_QNN(mRuntime->mQnnInterface.graphExecute(mQnnGraphHandle, inputs.data(), mInputTensorIndexes.size(), outputs.data(), mOutputTensorIndexes.size(), mQnnProfileHandle, mQnnSignalHandle));
+    MNN_PRINT("QNN executeGraph: %d inputs, %d outputs\n", (int)inputs.size(), (int)outputs.size());
+    for (int i = 0; i < (int)inputs.size(); i++) {
+        MNN_PRINT("  input[%d] id=%u type=%d buf=%p size=%u\n",
+                  i, inputs[i].v1.id, inputs[i].v1.type,
+                  inputs[i].v1.clientBuf.data, inputs[i].v1.clientBuf.dataSize);
+    }
+    for (int i = 0; i < (int)outputs.size(); i++) {
+        MNN_PRINT("  output[%d] id=%u type=%d buf=%p size=%u\n",
+                  i, outputs[i].v1.id, outputs[i].v1.type,
+                  outputs[i].v1.clientBuf.data, outputs[i].v1.clientBuf.dataSize);
+    }
+
+    auto ret = mRuntime->mQnnInterface.graphExecute(mQnnGraphHandle, inputs.data(), inputs.size(), outputs.data(), outputs.size(), mQnnProfileHandle, mQnnSignalHandle);
+    int errorCode = ret & 0xFFFF;
+    if (errorCode != QNN_SUCCESS) {
+        MNN_ERROR("QNN graphExecute FAILED: error code %d\n", errorCode);
+    } else {
+        MNN_PRINT("QNN graphExecute SUCCESS\n");
+        mGraphExecuted = true;
+    }
+
+    // Sync output data containers to host memory so that Tensor::clone()
+    // across sub-module boundaries gets valid data.
+    for (int i = 0; i < (int)mOutputTensors.size() && i < (int)mOutputTensorIndexes.size(); i++) {
+        int wrapperIdx = mOutputTensorIndexes[i];
+        if (wrapperIdx < 0 || wrapperIdx >= (int)mQNNTensorWrappers.size()) continue;
+        auto container = mQNNTensorWrappers[wrapperIdx]->getDataContainer();
+        auto tensor = mOutputTensors[i];
+        if (tensor && tensor->host<void>() && container && container->host<void>()) {
+            size_t bytes = (size_t)tensor->elementSize() * tensor->getType().bytes();
+            ::memcpy(tensor->host<void>(), container->host<void>(), bytes);
+            MNN_PRINT("QNN executeGraph: synced %zu bytes to OUTPUT tensor host\n", bytes);
+            // Debug: dump first few float values of the output
+            float* debugPtr = container->host<float>();
+            if (debugPtr) {
+                int numFloats = (int)(bytes / sizeof(float));
+                int printCount = numFloats < 8 ? numFloats : 8;
+                char dbgBuf[256];
+                int pos = 0;
+                for (int d = 0; d < printCount; d++) {
+                    pos += snprintf(dbgBuf + pos, sizeof(dbgBuf) - pos, " %.4f", debugPtr[d]);
+                }
+                MNN_PRINT("QNN output[%d] first %d values:%s\n", i, printCount, dbgBuf);
+            }
+        }
+    }
 }
 
 void QnnBackend::freeContextAndGraph() {
     if (mTensorCounter != 0) {
         mQnnGraphHandle = nullptr;
     }
-    mRuntime->freeContext();
+    // Free this backend's own context (not the runtime's shared one).
+    if (nullptr != mQnnContextHandle) {
+        CALL_QNN(mRuntime->mQnnInterface.contextFree(mQnnContextHandle, nullptr));
+        mQnnContextHandle = nullptr;
+    }
 }
 
 void QnnBackend::addNodeToGraph(Qnn_OpConfigVersion_t version, const char* nodeName, const char* packageName, const char* nodeType, std::vector<Qnn_Param_t> & params, std::vector<Qnn_Tensor_t> & inputs, std::vector<Qnn_Tensor_t> & outputs) {
@@ -1494,27 +1736,43 @@ int QnnBackend::getTensorIdx(const Tensor * tensor) const {
     auto iter = mTensorMap.find(tensorKey);
     int idx = -1;
     if (iter == mTensorMap.end()) {
-        std::string tName = "QnnTensor_" + std::to_string(mTensorCounter);;
-        if (TensorUtils::getDescribe(tensor)->usage != Tensor::InsideDescribe::Usage::CONSTANT) {
-            MNN_PRINT("Tensor usage is %d.\n", (int) TensorUtils::getDescribe(tensor)->usage);
-        }
-        #ifdef QNN_VERBOSE
-        MNN_PRINT("qnn tenor usage:%d, dimension:%d\n", TensorUtils::getDescribe(tensor)->usage, tensor->dimensions());
-        #endif
-        MNN_ASSERT(TensorUtils::getDescribe(tensor)->usage == Tensor::InsideDescribe::Usage::CONSTANT);
-        // MNN_ASSERT(tensor->dimensions() <= 2);
+        std::string tName = "QnnTensor_" + std::to_string(mTensorCounter);
         std::vector<uint32_t> tDims = getNHWCShape(tensor);
         Qnn_DataType_t tDataType;
         std::shared_ptr<QNNTensorWrapper> qnnTensorWrapper;
-        if (tensor->getType().code == halide_type_int && tensor->getType().bits == 32) {
-            tDataType = QNN_DATATYPE_INT_32;
-            qnnTensorWrapper = QNNTensorWrapper::createStaticTensor(tName, tDataType, tDims, tensor->host<int>());
-        } else if (tensor->getType().code == halide_type_float) {
-            tDataType = mUseFP16 ? QNN_DATATYPE_FLOAT_16 : QNN_DATATYPE_FLOAT_32;
-            qnnTensorWrapper = QNNTensorWrapper::createStaticFloatTensor(tName, tDataType, tDims, tensor->host<float>());
+
+        if (TensorUtils::getDescribe(tensor)->usage == Tensor::InsideDescribe::Usage::CONSTANT) {
+            // CONSTANT tensors: create static tensor with data
+            #ifdef QNN_VERBOSE
+            MNN_PRINT("qnn tenor usage:%d, dimension:%d\n", TensorUtils::getDescribe(tensor)->usage, tensor->dimensions());
+            #endif
+            if (tensor->getType().code == halide_type_int && tensor->getType().bits == 32) {
+                tDataType = QNN_DATATYPE_INT_32;
+                qnnTensorWrapper = QNNTensorWrapper::createStaticTensor(tName, tDataType, tDims, tensor->host<int>());
+            } else if (tensor->getType().code == halide_type_float) {
+                tDataType = mUseFP16 ? QNN_DATATYPE_FLOAT_16 : QNN_DATATYPE_FLOAT_32;
+                qnnTensorWrapper = QNNTensorWrapper::createStaticFloatTensor(tName, tDataType, tDims, tensor->host<float>());
+            } else {
+                MNN_ASSERT(false);
+            }
         } else {
-            MNN_ASSERT(false);
+            // Non-CONSTANT tensors not in map: create as NATIVE tensor to avoid nullptr crash.
+            // This typically happens when a backup QnnBackend instance encounters tensors
+            // that belong to the primary instance. The graph will likely fail at finalize
+            // but won't crash.
+            MNN_PRINT("QNN getTensorIdx[%p]: creating NATIVE tensor for unmapped tensor "
+                      "usage=%d dims=%d index=%d\n",
+                      this, (int)TensorUtils::getDescribe(tensor)->usage, tensor->dimensions(),
+                      TensorUtils::getDescribe(tensor)->index);
+            if (tensor->getType().code == halide_type_int && tensor->getType().bits == 32) {
+                tDataType = QNN_DATATYPE_INT_32;
+            } else {
+                tDataType = mUseFP16 ? QNN_DATATYPE_FLOAT_16 : QNN_DATATYPE_FLOAT_32;
+            }
+            Qnn_QuantizeParams_t tQuantizeParams = QNN_QUANTIZE_PARAMS_INIT;
+            qnnTensorWrapper = QNNTensorWrapper::create(tName, QNN_TENSOR_TYPE_NATIVE, tDataType, tDims, tQuantizeParams);
         }
+
         Qnn_Tensor_t * qnnTensor = qnnTensorWrapper->getNativeTensor();
         CALL_QNN(mRuntime->mQnnInterface.tensorCreateGraphTensor(mQnnGraphHandle, qnnTensor));
         mQNNTensorWrappers.push_back(qnnTensorWrapper);
@@ -1539,6 +1797,11 @@ void QnnBackend::addStageTensorToGraph(Qnn_Tensor_t * stageTensor) {
 
 Qnn_Tensor_t * QnnBackend::getNativeTensor(const Tensor * tensor) {
     int idx = getTensorIdx(tensor);
+    if (idx < 0 || idx >= (int)mQNNTensorWrappers.size()) {
+        MNN_ERROR("QNN getNativeTensor[%p]: invalid idx=%d (total=%d)\n",
+                  this, idx, (int)mQNNTensorWrappers.size());
+        return nullptr;
+    }
     return mQNNTensorWrappers[idx]->getNativeTensor();
 }
 
@@ -1554,6 +1817,12 @@ bool QnnBackend::getUseFP16() const {
 }
 
 void QnnBackend::clean() {
+    MNN_PRINT("QNN clean[%p]: tensorWrappers=%d tensorMap=%d outputCastMap=%d "
+              "extraInputs=%d extraOutputs=%d\n",
+              this,
+              (int)mQNNTensorWrappers.size(), (int)mTensorMap.size(),
+              (int)mOutputCastTensorMap.size(),
+              (int)mExtraInputWrappers.size(), (int)mExtraOutputWrappers.size());
     if (mQnnProfileHandle) {
         mRuntime->mQnnInterface.profileFree(mQnnProfileHandle);
         mQnnProfileHandle = nullptr;
@@ -1564,9 +1833,55 @@ void QnnBackend::clean() {
     mTensorMap.clear();
     mInputTensorIndexes.clear();
     mOutputTensorIndexes.clear();
+    mOutputTensors.clear();
     mDeQuantOutputTensorMap.clear();
     mInputCastTensorMap.clear();
     mOutputCastTensorMap.clear();
+    mExtraInputWrappers.clear();
+    mExtraOutputWrappers.clear();
+    mGraphFinalized = false;
+}
+
+void QnnBackend::registerExtraTensor(Qnn_Tensor_t* tensor) {
+    MNN_PRINT("QNN registerExtraTensor: name=%s type=%d dataType=%d rank=%d id_before=%u\n",
+              tensor->v1.name, tensor->v1.type, tensor->v1.dataType, tensor->v1.rank, tensor->v1.id);
+    auto ret = mRuntime->mQnnInterface.tensorCreateGraphTensor(mQnnGraphHandle, tensor);
+    int errorCode = ret & 0xFFFF;
+    MNN_PRINT("QNN registerExtraTensor: id_after=%u errorCode=%d\n", tensor->v1.id, errorCode);
+    if (errorCode != QNN_SUCCESS) {
+        MNN_ERROR("QNN registerExtraTensor FAILED: error code %d\n", errorCode);
+    }
+}
+
+void QnnBackend::registerExtraInput(std::shared_ptr<QNNTensorWrapper> wrapper) {
+    mExtraInputWrappers.push_back(wrapper);
+}
+
+void QnnBackend::registerExtraOutput(std::shared_ptr<QNNTensorWrapper> wrapper) {
+    mExtraOutputWrappers.push_back(wrapper);
+}
+
+std::shared_ptr<Tensor> QnnBackend::getInputDataContainer(const Tensor* tensor) const {
+    // For FP16 mode, input tensors have a staging FP32 APP_WRITE tensor
+    // in mInputCastTensorMap. Return that staging tensor's data container.
+    auto castIter = mInputCastTensorMap.find(TensorUtils::getDescribe(tensor));
+    if (castIter != mInputCastTensorMap.end()) {
+        int idx = getTensorIdx(castIter->second.second.get());
+        if (idx < 0 || idx >= (int)mQNNTensorWrappers.size()) {
+            MNN_ERROR("QNN getInputDataContainer[%p]: invalid idx=%d (total=%d)\n",
+                      this, idx, (int)mQNNTensorWrappers.size());
+            return nullptr;
+        }
+        return mQNNTensorWrappers[idx]->getDataContainer();
+    }
+    // Non-FP16: the tensor itself is APP_WRITE with a data container
+    int idx = getTensorIdx(tensor);
+    if (idx < 0 || idx >= (int)mQNNTensorWrappers.size()) {
+        MNN_ERROR("QNN getInputDataContainer[%p]: invalid idx=%d (total=%d)\n",
+                  this, idx, (int)mQNNTensorWrappers.size());
+        return nullptr;
+    }
+    return mQNNTensorWrappers[idx]->getDataContainer();
 }
 void QnnBackend::buildOutputDequant(){
     Qnn_OpConfigVersion_t mOpConfigVersion = QNN_OPCONFIG_VERSION_1;
@@ -1577,19 +1892,28 @@ void QnnBackend::buildOutputDequant(){
     std::vector<Qnn_Tensor_t> mInputs;
     std::vector<Qnn_Tensor_t> mOutputs;
     for(auto iter : mDeQuantOutputTensorMap){
+        auto* inputTensor = getNativeTensor(iter.second.first);
+        auto* outputTensor = getNativeTensor(iter.second.second.get());
+        if (!inputTensor || !outputTensor) {
+            MNN_PRINT("QNN buildOutputDequant: skipping entry with missing tensor\n");
+            continue;
+        }
         mNodeType.clear();
         mParams.clear();
         mInputs.clear();
         mOutputs.clear();
         mNodeType = "Dequantize";
         std::string name = "Dequantize_I_" + std::to_string(getTensorIdx(iter.second.first)) + "_O_" + std::to_string(getTensorIdx(iter.second.second.get()));
-        mInputs.push_back(*(getNativeTensor(iter.second.first))); // input
-        mOutputs.push_back(*(getNativeTensor(iter.second.second.get()))); // output
+        mInputs.push_back(*inputTensor);
+        mOutputs.push_back(*outputTensor);
         addNodeToGraph(mOpConfigVersion, name.c_str(), mPackageName.c_str(), mNodeType.c_str(), mParams, mInputs, mOutputs);
     }
 }
 
 void QnnBackend::buildOutputCast(){
+    MNN_PRINT("QNN buildOutputCast[%p]: entries=%d wrappers=%d tensorMap=%d\n",
+              this, (int)mOutputCastTensorMap.size(), (int)mQNNTensorWrappers.size(),
+              (int)mTensorMap.size());
     Qnn_OpConfigVersion_t mOpConfigVersion = QNN_OPCONFIG_VERSION_1;
     std::string mNodeName;
     std::string mPackageName = "qti.aisw";
@@ -1598,14 +1922,26 @@ void QnnBackend::buildOutputCast(){
     std::vector<Qnn_Tensor_t> mInputs;
     std::vector<Qnn_Tensor_t> mOutputs;
     for(auto iter : mOutputCastTensorMap){
+        // Validate both tensors exist in mTensorMap before building Cast node
+        int inputIdx = getTensorIdx(iter.second.first);
+        int outputIdx = getTensorIdx(iter.second.second.get());
+        if (inputIdx < 0 || inputIdx >= (int)mQNNTensorWrappers.size() ||
+            outputIdx < 0 || outputIdx >= (int)mQNNTensorWrappers.size()) {
+            MNN_PRINT("QNN buildOutputCast: skipping entry with invalid idx "
+                      "(inputIdx=%d outputIdx=%d total=%d)\n",
+                      inputIdx, outputIdx, (int)mQNNTensorWrappers.size());
+            continue;
+        }
+        auto* inputTensor = mQNNTensorWrappers[inputIdx]->getNativeTensor();
+        auto* outputTensor = mQNNTensorWrappers[outputIdx]->getNativeTensor();
         mNodeType.clear();
         mParams.clear();
         mInputs.clear();
         mOutputs.clear();
         mNodeType = "Cast";
         std::string name = "Cast_I_" + std::to_string(getTensorIdx(iter.second.first)) + "_O_" + std::to_string(getTensorIdx(iter.second.second.get()));
-        mInputs.push_back(*(getNativeTensor(iter.second.first))); // input
-        mOutputs.push_back(*(getNativeTensor(iter.second.second.get()))); // output
+        mInputs.push_back(*inputTensor);
+        mOutputs.push_back(*outputTensor);
         addNodeToGraph(mOpConfigVersion, name.c_str(), mPackageName.c_str(), mNodeType.c_str(), mParams, mInputs, mOutputs);
     }
 }
@@ -1625,9 +1961,16 @@ void QnnBackend::buildInputCast(const Tensor *tensor){
     mNodeType = "Cast";
     auto iter = mInputCastTensorMap.find(TensorUtils::getDescribe(tensor));
     if(iter != mInputCastTensorMap.end()){
+        auto* inputNative = getNativeTensor(iter->second.second.get());
+        auto* outputNative = getNativeTensor(iter->second.first);
+        if (!inputNative || !outputNative) {
+            MNN_ERROR("QNN buildInputCast[%p]: skipping, null tensor (input=%p output=%p)\n",
+                      this, inputNative, outputNative);
+            return;
+        }
         std::string name = "Cast_I_" + std::to_string(getTensorIdx(iter->second.second.get())) + "_O_" + std::to_string(getTensorIdx(iter->second.first));
-        mInputs.push_back(*(getNativeTensor(iter->second.second.get()))); // input
-        mOutputs.push_back(*(getNativeTensor(iter->second.first))); // output
+        mInputs.push_back(*inputNative);
+        mOutputs.push_back(*outputNative);
         addNodeToGraph(mOpConfigVersion, name.c_str(), mPackageName.c_str(), mNodeType.c_str(), mParams, mInputs, mOutputs);
     }
 }

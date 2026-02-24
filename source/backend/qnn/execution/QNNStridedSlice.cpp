@@ -102,6 +102,29 @@ ErrorCode QNNStridedSlice::onEncode(const std::vector<Tensor *> &inputs, const s
     uint32_t shrinkAxesData =  computeMask(param->shrinkAxisMask(), mInputDim, mDimType);
     uint32_t newAxesMaskData = computeMask(param->newAxisMask(), mInputDim, mDimType);
 
+    // Debug: log all StridedSlice parameters for diagnosis
+    {
+        char shapeBuf[128], rangeBuf[256];
+        int sp = 0, rp = 0;
+        for (int i = 0; i < mInputDim && i < 8; i++) {
+            sp += snprintf(shapeBuf + sp, sizeof(shapeBuf) - sp, "%d ", inputTensor->length(i));
+        }
+        for (int i = 0; i < mInputDim && i < 8; i++) {
+            rp += snprintf(rangeBuf + rp, sizeof(rangeBuf) - rp, "[%d,%d,%d] ",
+                           rangeData[3*i], rangeData[3*i+1], rangeData[3*i+2]);
+        }
+        char outShapeBuf[128];
+        int op2 = 0;
+        for (int i = 0; i < outputs[0]->dimensions() && i < 8; i++) {
+            op2 += snprintf(outShapeBuf + op2, sizeof(outShapeBuf) - op2, "%d ", outputs[0]->length(i));
+        }
+        MNN_PRINT("QNN StridedSlice[%s]: fromType=%d ndim=%d inShape=[%s] outShape=[%s] "
+                  "ranges=%s masks: begin=0x%x end=0x%x shrink=0x%x newaxis=0x%x\n",
+                  mNodeName.c_str(), param->fromType(), mInputDim,
+                  shapeBuf, outShapeBuf, rangeBuf,
+                  beginMaskData, endMaskData, shrinkAxesData, newAxesMaskData);
+    }
+
     this->createParamScalar("begin_mask", beginMaskData);
     this->createParamScalar("end_mask", endMaskData);
     this->createParamScalar("shrink_axes", shrinkAxesData);
@@ -133,8 +156,14 @@ void QNNStridedSlice::computeRangesType0(const std::vector<Tensor *> &inputs, st
     MNN_ASSERT(sliceDim == endTensor->length(0) && sliceDim == strideTensor->length(0));
 
     for (int i = 0; i < sliceDim; i++) {
-        beginRaw[i] = CLIP(beginRawSource[i], 0, inputs[0]->length(i) - 1);
-        endRaw[i] = CLIP(endRawSource[i], 1, inputs[0]->length(i));
+        int dimSize = inputs[0]->length(i);
+        int b = beginRawSource[i];
+        int e = endRawSource[i];
+        // Convert negative indices to positive (e.g., -1 → dimSize-1)
+        if (b < 0) b += dimSize;
+        if (e < 0) e += dimSize;
+        beginRaw[i] = CLIP(b, 0, dimSize - 1);
+        endRaw[i] = CLIP(e, 1, dimSize);
         strideRaw[i] = strideRawSource[i];
     }
     return;
@@ -156,8 +185,14 @@ void QNNStridedSlice::computeRangesType1(const std::vector<Tensor *> &inputs, st
     for (int i = 0; i < sliceDim; i++) {
         int tempAxis = axisTensor->host<int>()[i];
         tempAxis = tempAxis >= 0 ? tempAxis : (tempAxis + mInputDim);
-        beginRaw[tempAxis] = CLIP(beginRawSource[i], 0, inputs[0]->length(tempAxis) - 1);
-        endRaw[tempAxis] = CLIP(endRawSource[i], 1, inputs[0]->length(tempAxis));
+        int dimSize = inputs[0]->length(tempAxis);
+        int b = beginRawSource[i];
+        int e = endRawSource[i];
+        // Convert negative indices to positive (e.g., -1 → dimSize-1)
+        if (b < 0) b += dimSize;
+        if (e < 0) e += dimSize;
+        beginRaw[tempAxis] = CLIP(b, 0, dimSize - 1);
+        endRaw[tempAxis] = CLIP(e, 1, dimSize);
         strideRaw[tempAxis] = strideRawSource[i];
     }
     return;

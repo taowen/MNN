@@ -12,6 +12,7 @@
 // Qnn API Interface
 #include "QnnInterface.h"
 #include "HTP/QnnHtpGraph.h"
+#include "HTP/QnnHtpDevice.h"
 
 #include "core/Backend.hpp"
 #include "core/TensorUtils.hpp"
@@ -86,6 +87,14 @@ public:
         mReleaseFunc.push_back(func);
     }
 
+    // Extra I/O support for ops that manage their own APP_WRITE/APP_READ tensors
+    // (e.g., QNNKVCacheAttention's fixed-size KV cache buffers)
+    void registerExtraTensor(Qnn_Tensor_t* tensor);
+    void registerExtraInput(std::shared_ptr<QNNTensorWrapper> wrapper);
+    void registerExtraOutput(std::shared_ptr<QNNTensorWrapper> wrapper);
+    // Get the FP32 data container for an input tensor (handles FP16 cast staging)
+    std::shared_ptr<Tensor> getInputDataContainer(const Tensor* tensor) const;
+
 private:
     void clean();
 
@@ -95,6 +104,8 @@ private:
     std::unique_ptr<QNNPerf> mPerf;
 
     bool mUseFP16;
+    bool mGraphFinalized = false;
+    mutable bool mGraphExecuted = false;
     const BackendConfig::PowerMode mPower;
 
     // Qnn Profile
@@ -121,7 +132,12 @@ private:
     mutable std::map<const Tensor::InsideDescribe::NativeInsideDescribe *, std::pair<const Tensor*, std::shared_ptr<Tensor>>> mDeQuantOutputTensorMap;
     std::vector<int> mInputTensorIndexes;
     std::vector<int> mOutputTensorIndexes;
+    mutable std::vector<Tensor*> mOutputTensors; // parallel to mOutputTensorIndexes, for host sync
     std::vector<std::function<void()>> mReleaseFunc;
+
+    // Extra I/O tensors managed by individual ops (not through onAcquire)
+    std::vector<std::shared_ptr<QNNTensorWrapper>> mExtraInputWrappers;
+    std::vector<std::shared_ptr<QNNTensorWrapper>> mExtraOutputWrappers;
 };
 
 
