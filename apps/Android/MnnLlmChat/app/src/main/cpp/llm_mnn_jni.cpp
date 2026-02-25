@@ -667,4 +667,113 @@ Java_com_alibaba_mnnllm_android_llm_LlmSession_runBenchmarkNative(
     return env->NewObject(resultClass, resultCtor, testInstance, (jboolean)result.success, errorMessage);
 }
 
+JNIEXPORT void JNICALL
+Java_com_alibaba_mnnllm_android_llm_LlmSession_streamingStartNative(JNIEnv *env, jobject thiz,
+                                                                     jlong llm_ptr,
+                                                                     jstring prefix) {
+    auto *session = reinterpret_cast<mls::LlmSession *>(llm_ptr);
+    if (!session) return;
+    const char *prefix_cstr = env->GetStringUTFChars(prefix, nullptr);
+    session->StreamingStart(prefix_cstr);
+    env->ReleaseStringUTFChars(prefix, prefix_cstr);
+}
+
+JNIEXPORT void JNICALL
+Java_com_alibaba_mnnllm_android_llm_LlmSession_pushAudioChunkNative(JNIEnv *env, jobject thiz,
+                                                                     jlong llm_ptr,
+                                                                     jstring audio_file) {
+    auto *session = reinterpret_cast<mls::LlmSession *>(llm_ptr);
+    if (!session) return;
+    const char *file_cstr = env->GetStringUTFChars(audio_file, nullptr);
+    session->PushAudioChunk(file_cstr);
+    env->ReleaseStringUTFChars(audio_file, file_cstr);
+}
+
+JNIEXPORT jobject JNICALL
+Java_com_alibaba_mnnllm_android_llm_LlmSession_streamingFinishNative(JNIEnv *env, jobject thiz,
+                                                                      jlong llm_ptr,
+                                                                      jstring suffix,
+                                                                      jobject progressListener) {
+    auto *session = reinterpret_cast<mls::LlmSession *>(llm_ptr);
+    if (!session) {
+        jclass hashMapClass = env->FindClass("java/util/HashMap");
+        jmethodID hashMapInit = env->GetMethodID(hashMapClass, "<init>", "()V");
+        jmethodID putMethod = env->GetMethodID(hashMapClass, "put",
+                                               "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+        jobject hashMap = env->NewObject(hashMapClass, hashMapInit);
+        env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("error"),
+                              env->NewStringUTF("Failed, session not ready!"));
+        return hashMap;
+    }
+    const char *suffix_cstr = env->GetStringUTFChars(suffix, nullptr);
+    jclass progressListenerClass = env->GetObjectClass(progressListener);
+    jmethodID onProgressMethod = env->GetMethodID(progressListenerClass, "onProgress",
+                                                  "(Ljava/lang/String;)Z");
+    auto *context = session->StreamingFinish(suffix_cstr,
+        [&, progressListener, onProgressMethod](const std::string &response, bool is_eop) {
+            if (progressListener && onProgressMethod) {
+                jstring javaString = nullptr;
+                if (!is_eop) {
+                    // Convert to UTF-16 to safely handle any byte sequence
+                    // (NewStringUTF aborts on invalid Modified UTF-8 with CheckJNI)
+                    std::u16string u16;
+                    for (size_t i = 0; i < response.size(); ) {
+                        unsigned char c = response[i];
+                        if (c < 0x80) {
+                            u16.push_back(c); i++;
+                        } else if ((c & 0xE0) == 0xC0 && i+1 < response.size() && (response[i+1] & 0xC0) == 0x80) {
+                            u16.push_back(((c & 0x1F) << 6) | (response[i+1] & 0x3F)); i += 2;
+                        } else if ((c & 0xF0) == 0xE0 && i+2 < response.size() && (response[i+1] & 0xC0) == 0x80 && (response[i+2] & 0xC0) == 0x80) {
+                            u16.push_back(((c & 0x0F) << 12) | ((response[i+1] & 0x3F) << 6) | (response[i+2] & 0x3F)); i += 3;
+                        } else if ((c & 0xF8) == 0xF0 && i+3 < response.size() && (response[i+1] & 0xC0) == 0x80 && (response[i+2] & 0xC0) == 0x80 && (response[i+3] & 0xC0) == 0x80) {
+                            uint32_t cp = ((c & 0x07) << 18) | ((response[i+1] & 0x3F) << 12) | ((response[i+2] & 0x3F) << 6) | (response[i+3] & 0x3F);
+                            cp -= 0x10000;
+                            u16.push_back(0xD800 + (cp >> 10));
+                            u16.push_back(0xDC00 + (cp & 0x3FF));
+                            i += 4;
+                        } else {
+                            u16.push_back(0xFFFD); i++; // replacement character
+                        }
+                    }
+                    javaString = env->NewString(reinterpret_cast<const jchar*>(u16.data()), u16.size());
+                }
+                jboolean user_stop_requested = env->CallBooleanMethod(progressListener,
+                                                                      onProgressMethod, javaString);
+                if (javaString) env->DeleteLocalRef(javaString);
+                return (bool) user_stop_requested;
+            }
+            return true;
+        });
+    env->ReleaseStringUTFChars(suffix, suffix_cstr);
+
+    // Build result HashMap
+    int64_t prompt_len = 0, decode_len = 0, audio_time = 0, prefill_time = 0, decode_time = 0;
+    if (context) {
+        prompt_len = context->prompt_len;
+        decode_len = context->gen_seq_len;
+        audio_time = context->audio_us;
+        prefill_time = context->prefill_us;
+        decode_time = context->decode_us;
+    }
+    jclass hashMapClass = env->FindClass("java/util/HashMap");
+    jmethodID hashMapInit = env->GetMethodID(hashMapClass, "<init>", "()V");
+    jmethodID putMethod = env->GetMethodID(hashMapClass, "put",
+                                           "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+    jobject hashMap = env->NewObject(hashMapClass, hashMapInit);
+    jclass longClass = env->FindClass("java/lang/Long");
+    jmethodID longInit = env->GetMethodID(longClass, "<init>", "(J)V");
+
+    env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("prompt_len"),
+                          env->NewObject(longClass, longInit, prompt_len));
+    env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("decode_len"),
+                          env->NewObject(longClass, longInit, decode_len));
+    env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("audio_time"),
+                          env->NewObject(longClass, longInit, audio_time));
+    env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("prefill_time"),
+                          env->NewObject(longClass, longInit, prefill_time));
+    env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("decode_time"),
+                          env->NewObject(longClass, longInit, decode_time));
+    return hashMap;
+}
+
 } // extern "C"

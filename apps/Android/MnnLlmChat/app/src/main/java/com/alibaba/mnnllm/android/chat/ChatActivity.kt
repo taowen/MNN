@@ -183,6 +183,36 @@ class ChatActivity : AppCompatActivity() {
             setOnStopGenerating{
                 chatPresenter.stopGenerate()
             }
+            setOnStreamingAsrStarted {
+                val userData = ChatDataItem(ChatViewHolders.USER)
+                userData.text = "\uD83C\uDF99 [Voice Input]"
+                userData.time = dateFormat!!.format(Date())
+                val listener = object : ChatPresenter.GenerateListener {
+                    override fun onGenerateStart() {
+                        this@ChatActivity.onGenerateStart(userData)
+                    }
+                    override fun onLlmGenerateProgress(progress: String?, generateResultProcessor: GenerateResultProcessor) {
+                        this@ChatActivity.onLlmGenerateProgress(progress, generateResultProcessor)
+                    }
+                    override fun onDiffusionGenerateProgress(progress: String?, diffusionDestPath: String?) {
+                        this@ChatActivity.onDiffusionGenerateProgress(progress, diffusionDestPath)
+                    }
+                    override fun onGenerateFinished(benchMarkResult: HashMap<String, Any>) {
+                        this@ChatActivity.onGenerateFinished(benchMarkResult)
+                    }
+                }
+                chatPresenter.startStreamingAsr(userData, listener)
+            }
+            setOnAudioChunkReady { chunkPath ->
+                chatPresenter.pushStreamingChunk(chunkPath)
+            }
+            setOnStreamingAsrFinished {
+                chatPresenter.finishStreamingAsr()
+            }
+            setOnStreamingAsrCanceled {
+                chatPresenter.cancelStreamingAsr()
+                setIsGenerating(false)
+            }
         }
     }
 

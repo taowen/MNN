@@ -111,6 +111,11 @@ public:
     virtual void response(const std::vector<int>& input_ids, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1) override;
     virtual void setWavformCallback(std::function<bool(const float*, size_t, bool)> callback) override;
     virtual void generateWavform() override;
+    virtual bool hasMultimodalContent() const override;
+    // streaming ASR
+    void streamingStart(const std::string& prompt_prefix) override;
+    void pushAudioChunk(const std::string& audio_file) override;
+    void streamingFinish(const std::string& prompt_suffix, std::ostream* os = nullptr, const char* end_with = nullptr, int max_new_tokens = -1) override;
     // some models preprocess function
     std::vector<int> visionProcess(VARP image);
     std::vector<int> defaultVisionProcess(VARP image);
@@ -120,6 +125,7 @@ public:
 private:
     int mVisionHeight = 448, mVisionWidth = 448, mVisionStart = 151857,
         mVisionEnd = 151858, mVisionPad = 151859, mAudioPad = 151646;
+    int mNWindow = 50, mNWindowInfer = 0;
     int mVisionGlobal = 49152;
     int mVisionSizeUnit = 1, mVisionMaxSize = 2048;
     int mVisionNum = 0;

@@ -153,6 +153,15 @@
             android:exported="false"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen" />
 
+        <receiver
+            android:name="com.alibaba.mnnllm.android.test.TestBackdoorReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.alibaba.mnnllm.android.TEST" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

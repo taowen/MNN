@@ -3,6 +3,8 @@
 package com.alibaba.mnnllm.android
 
 import android.app.Application
+import android.system.Os
+import android.util.Log
 import com.facebook.stetho.Stetho
 import com.facebook.stetho.dumpapp.DumperPlugin
 import com.alibaba.mnnllm.android.debug.ModelListDumperPlugin
@@ -24,6 +26,7 @@ class MnnLlmApplication : Application() {
         CrashUtil.init(this)
         instance = this
         DeviceName.init(this)
+        setupQnnEnvironment()
 
         // Initialize CurrentActivityTracker
         CurrentActivityTracker.initialize(this)
@@ -48,7 +51,27 @@ class MnnLlmApplication : Application() {
         }
     }
 
+    private fun setupQnnEnvironment() {
+        try {
+            val nativeLibDir = applicationInfo.nativeLibraryDir
+            // ADSP_LIBRARY_PATH tells FastRPC where to find DSP skeleton libs.
+            // Include vendor paths where libQnnHtpV79Skel.so may reside.
+            val adspPath = listOf(
+                nativeLibDir,
+                "/vendor/lib64/hw/audio",
+                "/vendor/dsp",
+                "/vendor/dsp/xdsp"
+            ).joinToString(";")
+            Log.i(TAG, "Setting ADSP_LIBRARY_PATH=$adspPath")
+            Os.setenv("ADSP_LIBRARY_PATH", adspPath, true)
+            Os.setenv("LD_LIBRARY_PATH", nativeLibDir, true)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to set QNN environment: ${e.message}")
+        }
+    }
+
     companion object {
+        private const val TAG = "MnnLlmApplication"
         private lateinit var instance: MnnLlmApplication
 
         fun getAppContext(): Context {

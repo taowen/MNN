@@ -42,6 +42,10 @@ class ChatInputComponent(
     private var onThinkingModeChanged: ((Boolean) -> Unit)? = null
     private var onAudioOutputModeChanged: ((Boolean) -> Unit)? = null
     private var onSendMessage: ((ChatDataItem) -> Unit)? = null
+    private var onStreamingAsrStarted: (() -> Unit)? = null
+    private var onAudioChunkReady: ((String) -> Unit)? = null
+    private var onStreamingAsrFinished: (() -> Unit)? = null
+    private var onStreamingAsrCanceled: (() -> Unit)? = null
     private lateinit var editUserMessage: EditText
     private var buttonSend: ImageView = binding.btnSend
     private lateinit var imageMore: ImageView
@@ -83,7 +87,8 @@ class ChatInputComponent(
         }
         // Update voice recording module
         voiceRecordingModule.updateModel(newModelName)
-        
+        voiceRecordingModule.updateStreamingMode(ModelTypeUtils.isAudioModel(newModelId))
+
         // Update voice button visibility
         updateVoiceButtonVisibility()
     }
@@ -308,8 +313,25 @@ class ChatInputComponent(
 
             override fun onRecordCanceled() {
             }
+
+            override fun onStreamingStarted() {
+                this@ChatInputComponent.onStreamingAsrStarted?.invoke()
+            }
+
+            override fun onAudioChunkReady(chunkPath: String) {
+                this@ChatInputComponent.onAudioChunkReady?.invoke(chunkPath)
+            }
+
+            override fun onStreamingFinished() {
+                this@ChatInputComponent.onStreamingAsrFinished?.invoke()
+            }
+
+            override fun onStreamingCanceled() {
+                this@ChatInputComponent.onStreamingAsrCanceled?.invoke()
+            }
         })
-        voiceRecordingModule!!.setup(chatActivity.isAudioModel)
+        val isStreamingAsr = ModelTypeUtils.isAudioModel(currentModelId)
+        voiceRecordingModule.setup(chatActivity.isAudioModel, isStreamingAsr)
     }
 
     fun setOnSendMessage(onSendMessage: (ChatDataItem)->Unit) {
@@ -361,6 +383,22 @@ class ChatInputComponent(
 
     fun setOnStopGenerating(onStopGenerating: () -> Unit) {
         this.onStopGenerating = onStopGenerating
+    }
+
+    fun setOnStreamingAsrStarted(callback: () -> Unit) {
+        this.onStreamingAsrStarted = callback
+    }
+
+    fun setOnAudioChunkReady(callback: (String) -> Unit) {
+        this.onAudioChunkReady = callback
+    }
+
+    fun setOnStreamingAsrFinished(callback: () -> Unit) {
+        this.onStreamingAsrFinished = callback
+    }
+
+    fun setOnStreamingAsrCanceled(callback: () -> Unit) {
+        this.onStreamingAsrCanceled = callback
     }
 
 }

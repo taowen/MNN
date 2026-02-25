@@ -37,7 +37,7 @@ static void saveInputOutputs(const MNN::Express::Module::Info* info, std::vector
     MNN_PRINT("Successfully generate %s and %s.\n", inputPath.c_str(), outputPath.c_str());
 }
 
-static void createInputsForLLM(int seqLen, int hiddenSize, const std::string& attentionMaskType, bool lastLogit, std::vector<MNN::Express::VARP>& inputs) {
+static void createInputsForLLM(int seqLen, int hiddenSize, const std::string& attentionMaskType, bool lastLogit, bool isMrope, std::vector<MNN::Express::VARP>& inputs) {
     if (attentionMaskType != "float") {
         MNN_ERROR("Don't support Attention Mask Type other than 'float', currently.\n");
         return;
@@ -59,12 +59,23 @@ static void createInputsForLLM(int seqLen, int hiddenSize, const std::string& at
     }
     inputs.push_back(attentionMask);
 
-    MNN::Express::VARP positionIds = MNN::Express::_Input({seqLen}, MNN::Express::NCHW, halide_type_of<int>());
-    int * positionIdsData = positionIds->writeMap<int>();
-    for (int i = 0; i < seqLen; i++) {
-        positionIdsData[i] = i;
+    if (isMrope) {
+        MNN::Express::VARP positionIds = MNN::Express::_Input({3, seqLen}, MNN::Express::NCHW, halide_type_of<int>());
+        int * positionIdsData = positionIds->writeMap<int>();
+        for (int d = 0; d < 3; d++) {
+            for (int i = 0; i < seqLen; i++) {
+                positionIdsData[d * seqLen + i] = i;
+            }
+        }
+        inputs.push_back(positionIds);
+    } else {
+        MNN::Express::VARP positionIds = MNN::Express::_Input({seqLen}, MNN::Express::NCHW, halide_type_of<int>());
+        int * positionIdsData = positionIds->writeMap<int>();
+        for (int i = 0; i < seqLen; i++) {
+            positionIdsData[i] = i;
+        }
+        inputs.push_back(positionIds);
     }
-    inputs.push_back(positionIds);
 
     int logitsIndexValue = lastLogit ? -1 : 0;
     MNN::Express::VARP logitsIndex = MNN::Express::_Const((const void *) &logitsIndexValue, {1}, MNN::Express::NHWC, halide_type_of<int>());
@@ -80,6 +91,7 @@ static void generateForLLM(const std::string& modelPath, const std::string& outp
 
     int hiddenSize;
     std::string attentionMaskType;
+    bool isMrope = false;
     {
         std::ifstream ifs(jsonPath);
         if (!ifs.is_open()) {
@@ -106,6 +118,10 @@ static void generateForLLM(const std::string& modelPath, const std::string& outp
             return;
         }
         attentionMaskType = doc["attention_mask"].GetString();
+
+        if (doc.HasMember("is_mrope") && doc["is_mrope"].IsBool()) {
+            isMrope = doc["is_mrope"].GetBool();
+        }
     }
 
     // Load Model.
@@ -117,7 +133,7 @@ static void generateForLLM(const std::string& modelPath, const std::string& outp
     {
         std::vector<MNN::Express::VARP> inputs;
         std::vector<MNN::Express::VARP> outputs;
-        createInputsForLLM(blockSize, hiddenSize, attentionMaskType, false, inputs);
+        createInputsForLLM(blockSize, hiddenSize, attentionMaskType, false, isMrope, inputs);
         outputs = net->onForward(inputs);
         saveInputOutputs(net->getInfo(), inputs, outputs, outputDir, blockSize);
     }
@@ -125,7 +141,7 @@ static void generateForLLM(const std::string& modelPath, const std::string& outp
     {
         std::vector<MNN::Express::VARP> inputs;
         std::vector<MNN::Express::VARP> outputs;
-        createInputsForLLM(1, hiddenSize, attentionMaskType, true, inputs);
+        createInputsForLLM(1, hiddenSize, attentionMaskType, true, isMrope, inputs);
         outputs = net->onForward(inputs);
         saveInputOutputs(net->getInfo(), inputs, outputs, outputDir, 1);
     }

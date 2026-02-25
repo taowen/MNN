@@ -168,6 +168,13 @@ class LlmSession (
         return generateNewSessionId()
     }
 
+    /** Reset native model state (clear KV cache) without changing sessionId. */
+    fun resetForStreaming() {
+        synchronized(this) {
+            resetNative(nativePtr)
+        }
+    }
+
     override fun release() {
         synchronized(this) {
             Log.d(
@@ -267,6 +274,22 @@ class LlmSession (
     fun updateConfig(configJson: String) {
         Log.d(TAG, "updateConfig: $configJson")
         updateConfigNative(nativePtr, configJson)
+    }
+
+    // Streaming ASR native methods
+    private external fun streamingStartNative(instanceId: Long, promptPrefix: String)
+    private external fun pushAudioChunkNative(instanceId: Long, audioFile: String)
+    private external fun streamingFinishNative(instanceId: Long, promptSuffix: String,
+        listener: GenerateProgressListener): HashMap<String, Any>
+
+    fun streamingStart(promptPrefix: String) {
+        streamingStartNative(nativePtr, promptPrefix)
+    }
+    fun pushAudioChunk(audioFile: String) {
+        pushAudioChunkNative(nativePtr, audioFile)
+    }
+    fun streamingFinish(promptSuffix: String, listener: GenerateProgressListener): HashMap<String, Any> {
+        return streamingFinishNative(nativePtr, promptSuffix, listener)
     }
 
     private external fun updateEnableAudioOutputNative(llmPtr: Long, enable: Boolean)

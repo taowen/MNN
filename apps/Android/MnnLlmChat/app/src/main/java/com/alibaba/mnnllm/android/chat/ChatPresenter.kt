@@ -18,9 +18,11 @@ import com.alibaba.mnnllm.android.model.ModelTypeUtils
 import com.alibaba.mnnllm.android.model.ModelUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import java.text.DateFormat
 import java.util.Random
@@ -271,6 +273,155 @@ class ChatPresenter(
     fun stopGenerate() {
         stopGenerating = true
     }
+
+    // --- Streaming ASR (cumulative replay) ---
+    private var streamingChunkChannel: Channel<String>? = null
+    private var streamingJob: Job? = null
+
+    fun startStreamingAsr(userData: ChatDataItem, generateListener: GenerateListener) {
+        this.generateListener = generateListener
+
+        if (this.sessionName.isNullOrEmpty()) {
+            this.sessionName = SessionUtils.generateSessionName(userData)
+            chatDataManager!!.addOrUpdateSession(sessionId!!, modelId)
+            chatDataManager!!.updateSessionName(sessionId!!, sessionName)
+        }
+        chatDataManager!!.addChatData(sessionId, userData)
+
+        chatActivity.lifecycleScope.launch {
+            generateListener.onGenerateStart()
+            additionalListeners.forEach { it.onGenerateStart() }
+        }
+
+        val channel = Channel<String>(Channel.UNLIMITED)
+        streamingChunkChannel = channel
+        stopGenerating = false
+
+        streamingJob = presenterScope.launch {
+            val allChunkPaths = mutableListOf<String>()
+            try {
+                val llmSession = getLlmSession() ?: return@launch
+                var channelClosed = false
+
+                while (!channelClosed && !stopGenerating) {
+                    // Wait for at least one new chunk
+                    if (allChunkPaths.isEmpty()) {
+                        val chunk = channel.receiveCatching().getOrNull()
+                        if (chunk == null) { channelClosed = true; break }
+                        allChunkPaths.add(chunk)
+                    }
+
+                    // Drain any additional pending chunks
+                    while (true) {
+                        val result = channel.tryReceive()
+                        if (result.isSuccess) {
+                            allChunkPaths.add(result.getOrThrow())
+                        } else if (result.isClosed) {
+                            channelClosed = true
+                            break
+                        } else break
+                    }
+
+                    if (allChunkPaths.isEmpty()) break
+
+                    // Run one transcription cycle with all accumulated chunks
+                    val isFinal = channelClosed
+                    llmSession.resetForStreaming()
+                    stopGenerating = false
+
+                    llmSession.streamingStart(ASR_PREFIX)
+                    for (path in allChunkPaths) {
+                        if (stopGenerating) break
+                        llmSession.pushAudioChunk(path)
+                    }
+                    if (stopGenerating) break
+
+                    val processor = GenerateResultProcessor()
+                    processor.generateBegin()
+                    val result = llmSession.streamingFinish(
+                        ASR_SUFFIX,
+                        object : GenerateProgressListener {
+                            override fun onProgress(progress: String?): Boolean {
+                                processor.process(progress)
+                                if (isFinal) {
+                                    chatActivity.lifecycleScope.launch {
+                                        this@ChatPresenter.generateListener?.onLlmGenerateProgress(
+                                            progress, processor
+                                        )
+                                        additionalListeners.forEach {
+                                            it.onLlmGenerateProgress(progress, processor)
+                                        }
+                                    }
+                                }
+                                return stopGenerating
+                            }
+                        }
+                    )
+                    result["response"] = processor.getRawResult()
+
+                    if (isFinal) {
+                        chatActivity.lifecycleScope.launch {
+                            this@ChatPresenter.generateListener?.onGenerateFinished(result)
+                            additionalListeners.forEach { it.onGenerateFinished(result) }
+                        }
+                        break
+                    }
+
+                    // Intermediate cycle: update UI with full result at once
+                    chatActivity.lifecycleScope.launch {
+                        this@ChatPresenter.generateListener?.onLlmGenerateProgress(
+                            null, processor
+                        )
+                        additionalListeners.forEach {
+                            it.onLlmGenerateProgress(null, processor)
+                        }
+                    }
+
+                    // Wait for next chunk before starting another cycle
+                    val nextChunk = channel.receiveCatching().getOrNull()
+                    if (nextChunk != null) {
+                        allChunkPaths.add(nextChunk)
+                    } else {
+                        channelClosed = true
+                        // Need one more final cycle - loop will handle it
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Streaming ASR error", e)
+                val errorResult = HashMap<String, Any>().apply {
+                    put("error", true)
+                    put("message", e.message ?: "Streaming ASR failed")
+                    put("response", "Streaming ASR failed")
+                }
+                chatActivity.lifecycleScope.launch {
+                    this@ChatPresenter.generateListener?.onGenerateFinished(errorResult)
+                    additionalListeners.forEach { it.onGenerateFinished(errorResult) }
+                }
+            } finally {
+                allChunkPaths.forEach { path ->
+                    try { java.io.File(path).delete() } catch (_: Exception) {}
+                }
+                streamingChunkChannel = null
+                streamingJob = null
+            }
+        }
+    }
+
+    fun pushStreamingChunk(path: String) {
+        streamingChunkChannel?.trySend(path)
+    }
+
+    fun finishStreamingAsr() {
+        streamingChunkChannel?.close()
+    }
+
+    fun cancelStreamingAsr() {
+        stopGenerating = true
+        streamingChunkChannel?.close()
+        streamingJob?.cancel()
+        streamingChunkChannel = null
+        streamingJob = null
+    }
     
     /**
      * Default GenerateListener that handles ChatActivity UI updates
@@ -425,6 +576,8 @@ class ChatPresenter(
 
     companion object {
         private const val TAG: String = "ChatPresenter"
+        private const val ASR_PREFIX = "<|im_start|>user\n<|audio_start|>"
+        private const val ASR_SUFFIX = "<|audio_end|><|im_end|>\n<|im_start|>assistant\n"
     }
 
     interface GenerateListener {

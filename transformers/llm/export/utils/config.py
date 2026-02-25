@@ -30,18 +30,70 @@ class LlmConfig(PretrainedConfig):
     def _register_external_model(model_type: str):
         EXTERNAL_MODEL_REGISTRY = {
             'funaudiochat': ('funaudiochat.register', 'register_funaudiochat'),
+            'qwen3_asr': None,  # handled specially below
         }
         if model_type in EXTERNAL_MODEL_REGISTRY:
-            module_path, func_name = EXTERNAL_MODEL_REGISTRY[model_type]
+            entry = EXTERNAL_MODEL_REGISTRY[model_type]
+            if entry is None:
+                # Special handling: register from transformers_backend subpackage
+                # to avoid heavy __init__.py deps (librosa, nagisa, etc.)
+                LlmConfig._register_qwen3_asr()
+                return
+            module_path, func_name = entry
             try:
                 import importlib
                 module = importlib.import_module(module_path)
-                getattr(module, func_name)()
+                if func_name:
+                    getattr(module, func_name)()
             except ImportError:
                 raise ImportError(
                     f"{model_type} requires external package. "
                     f"Please clone it from GitHub and set PYTHONPATH accordingly."
                 )
+
+    @staticmethod
+    def _register_qwen3_asr():
+        import sys, importlib
+        # Find qwen_asr package root from PYTHONPATH
+        qwen_asr_root = None
+        for p in sys.path:
+            candidate = os.path.join(p, 'qwen_asr', 'core', 'transformers_backend')
+            if os.path.isdir(candidate):
+                qwen_asr_root = p
+                break
+        if qwen_asr_root is None:
+            raise ImportError(
+                "qwen3_asr requires the Qwen3-ASR package. "
+                "Please set PYTHONPATH to include the Qwen3-ASR repo root."
+            )
+        # Temporarily block qwen_asr's __init__.py by pre-registering a stub
+        stub_name = 'qwen_asr'
+        had_module = stub_name in sys.modules
+        old_module = sys.modules.get(stub_name)
+        import types
+        stub = types.ModuleType(stub_name)
+        stub.__path__ = [os.path.join(qwen_asr_root, 'qwen_asr')]
+        stub.__package__ = stub_name
+        sys.modules[stub_name] = stub
+        # Also stub qwen_asr.core
+        core_name = 'qwen_asr.core'
+        core_stub = types.ModuleType(core_name)
+        core_stub.__path__ = [os.path.join(qwen_asr_root, 'qwen_asr', 'core')]
+        core_stub.__package__ = core_name
+        sys.modules[core_name] = core_stub
+        try:
+            config_mod = importlib.import_module('qwen_asr.core.transformers_backend.configuration_qwen3_asr')
+            modeling_mod = importlib.import_module('qwen_asr.core.transformers_backend.modeling_qwen3_asr')
+            from transformers import AutoConfig, AutoModel
+            AutoConfig.register("qwen3_asr", config_mod.Qwen3ASRConfig)
+            AutoModel.register(config_mod.Qwen3ASRConfig, modeling_mod.Qwen3ASRForConditionalGeneration)
+        finally:
+            # Restore original module state
+            if had_module:
+                sys.modules[stub_name] = old_module
+            else:
+                sys.modules.pop(stub_name, None)
+            sys.modules.pop(core_name, None)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
@@ -52,7 +104,12 @@ class LlmConfig(PretrainedConfig):
             model_type = raw_config.get('model_type')
             cls._register_external_model(model_type)
 
-        config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True, **kwargs)
+        try:
+            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True, **kwargs)
+        except (ValueError, KeyError):
+            # Fallback for model types not yet in transformers (e.g. qwen3_asr)
+            from transformers import PretrainedConfig
+            config = PretrainedConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True, **kwargs)
 
         model_type, model_map = ModelMapper().get_map(config)
         llm_config_kwargs = {

@@ -106,9 +106,44 @@ static void createQnnContext(){
         if (supportDevice) {
             const QnnDevice_Config_t ** deviceConfig = nullptr;
             auto qnnStatus = qnnInterface.deviceCreate(logHandle, deviceConfig, &deviceHandle);
-            if(qnnStatus != QNN_SUCCESS || (deviceHandle == nullptr)) {
-                MNN_PRINT("MNN_QNN: Failed to create the device, error:%lu\n", (unsigned long)qnnStatus);
-                return;
+            if (qnnStatus != QNN_SUCCESS || deviceHandle == nullptr) {
+                // Newer SoCs (e.g. SM8750) require explicit SoC config
+                MNN_PRINT("MNN_QNN: Default device creation failed (error:%lu), retrying with SoC config\n", (unsigned long)qnnStatus);
+                deviceHandle = nullptr;
+
+                // Build HTP custom config with SoC model auto-detection
+                // The SoC model will be validated by the driver
+                QnnHtpDevice_CustomConfig_t htpSocConfig = {};
+                htpSocConfig.option = QNN_HTP_DEVICE_CONFIG_OPTION_SOC;
+                htpSocConfig.socModel = 0; // Will be auto-detected below
+
+                // Try known SoC models from newest to oldest
+                static const uint32_t knownSocs[] = {
+                    69,  // QNN_SOC_MODEL_SM8750 (Snapdragon 8 Elite, HTP V79)
+                    57,  // QNN_SOC_MODEL_SM8650 (Snapdragon 8 Gen 3, HTP V75)
+                    43,  // QNN_SOC_MODEL_SM8550 (Snapdragon 8 Gen 2, HTP V73)
+                    36,  // QNN_SOC_MODEL_SM8450 (Snapdragon 8 Gen 1, HTP V69)
+                };
+
+                QnnDevice_Config_t socDeviceConfig = QNN_DEVICE_CONFIG_INIT;
+                socDeviceConfig.option = QNN_DEVICE_CONFIG_OPTION_CUSTOM;
+                socDeviceConfig.customConfig = &htpSocConfig;
+                const QnnDevice_Config_t* deviceConfigArray[] = {&socDeviceConfig, nullptr};
+
+                for (uint32_t soc : knownSocs) {
+                    htpSocConfig.socModel = soc;
+                    qnnStatus = qnnInterface.deviceCreate(logHandle, deviceConfigArray, &deviceHandle);
+                    if (qnnStatus == QNN_SUCCESS && deviceHandle != nullptr) {
+                        MNN_PRINT("MNN_QNN: Device created with SoC model %u\n", soc);
+                        break;
+                    }
+                    deviceHandle = nullptr;
+                }
+
+                if (deviceHandle == nullptr) {
+                    MNN_PRINT("MNN_QNN: Failed to create device with any known SoC config, error:%lu\n", (unsigned long)qnnStatus);
+                    return;
+                }
             }
 
             if (qnnInterface.deviceGetPlatformInfo == nullptr) {

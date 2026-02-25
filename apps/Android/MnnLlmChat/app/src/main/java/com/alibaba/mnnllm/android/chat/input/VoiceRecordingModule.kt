@@ -41,11 +41,15 @@ class VoiceRecordingModule(private val activity: ChatActivity) {
     private var enabled = false
     private var currentModelName: String = ""
 
+    private var streamingAsrModule: StreamingAsrModule? = null
+    private var isStreamingMode = false
+
     fun setOnVoiceRecordingListener(listener: VoiceRecordingListener?) {
         this.listener = listener
     }
 
-    fun setup(isAudioModel: Boolean) {
+    fun setup(isAudioModel: Boolean, isStreamingAsr: Boolean = false) {
+        this.isStreamingMode = isStreamingAsr
         buttonSwitchVoice = activity.findViewById(R.id.bt_switch_audio)
         updateVoiceButtonVisibility(isAudioModel)
         inputCardContainer = activity.findViewById(R.id.input_card_container)
@@ -93,7 +97,7 @@ class VoiceRecordingModule(private val activity: ChatActivity) {
         }
         if (event.action == MotionEvent.ACTION_UP) {
             Log.d(TAG, "onTouch up stop recording")
-            if (waveRecorder == null) {
+            if (waveRecorder == null && streamingAsrModule == null) {
                 return false
             }
             endAudioRecording(isCancelRecord)
@@ -118,7 +122,7 @@ class VoiceRecordingModule(private val activity: ChatActivity) {
                 updateRecordingUI()
             }
         } else if (event.action == MotionEvent.ACTION_CANCEL) {
-            if (waveRecorder != null) {
+            if (waveRecorder != null || streamingAsrModule != null) {
                 endAudioRecording(true)
             }
         }
@@ -152,35 +156,66 @@ class VoiceRecordingModule(private val activity: ChatActivity) {
 
     private fun endAudioRecording(cancel: Boolean) {
         inputCardContainer.setCardBackgroundColor(Color.TRANSPARENT)
-        waveRecorder!!.stopRecording()
-        voceRecordingWave!!.visibility = View.GONE
-        if (listener != null) {
-            val duration = (System.currentTimeMillis() - mStartRecordTime) / 1000f
-            if (!cancel && duration > 1) {
-                listener!!.onRecordSuccess(duration, this.recordingFilePath)
+        if (isStreamingMode && streamingAsrModule != null) {
+            val result = streamingAsrModule!!.stop()
+            voceRecordingWave!!.visibility = View.GONE
+            textVoiceHint!!.visibility = View.GONE
+            if (cancel || result == null) {
+                streamingAsrModule?.cleanup()
+                streamingAsrModule = null
+                listener?.onStreamingCanceled()
             } else {
-                this.recordingFilePath?.let { File(it).delete() }
-                listener!!.onRecordCanceled()
+                // Final chunk was already delivered via onChunkReady
+                streamingAsrModule = null
+                listener?.onStreamingFinished()
             }
+        } else {
+            waveRecorder!!.stopRecording()
+            voceRecordingWave!!.visibility = View.GONE
+            if (listener != null) {
+                val duration = (System.currentTimeMillis() - mStartRecordTime) / 1000f
+                if (!cancel && duration > 1) {
+                    listener!!.onRecordSuccess(duration, this.recordingFilePath)
+                } else {
+                    this.recordingFilePath?.let { File(it).delete() }
+                    listener!!.onRecordCanceled()
+                }
+            }
+            textVoiceHint!!.visibility = View.GONE
+            waveRecorder = null
         }
-        textVoiceHint!!.visibility = View.GONE
-        waveRecorder = null
         isCancelRecord = false
     }
 
     private fun startAudioRecording() {
-        recordingFilePath = FileUtils.generateDestRecordFilePath(
-            activity, activity.sessionId!!
-        )
-        Log.d(
-            TAG,
-            "onTouch down start recording: $recordingFilePath"
-        )
-        waveRecorder = WaveRecorder(recordingFilePath!!)
-        mStartRecordTime = System.currentTimeMillis()
-        waveRecorder!!.startRecording()
-        voceRecordingWave!!.visibility = View.VISIBLE
-        updateRecordingUI()
+        if (isStreamingMode) {
+            Log.d(TAG, "Starting streaming ASR recording")
+            val module = StreamingAsrModule()
+            module.onChunkReady = { chunkPath ->
+                activity.runOnUiThread {
+                    listener?.onAudioChunkReady(chunkPath)
+                }
+            }
+            streamingAsrModule = module
+            mStartRecordTime = System.currentTimeMillis()
+            module.start(activity.cacheDir)
+            voceRecordingWave!!.visibility = View.VISIBLE
+            updateRecordingUI()
+            listener?.onStreamingStarted()
+        } else {
+            recordingFilePath = FileUtils.generateDestRecordFilePath(
+                activity, activity.sessionId!!
+            )
+            Log.d(
+                TAG,
+                "onTouch down start recording: $recordingFilePath"
+            )
+            waveRecorder = WaveRecorder(recordingFilePath!!)
+            mStartRecordTime = System.currentTimeMillis()
+            waveRecorder!!.startRecording()
+            voceRecordingWave!!.visibility = View.VISIBLE
+            updateRecordingUI()
+        }
     }
 
     fun isRecordingMode():Boolean {
@@ -232,6 +267,10 @@ class VoiceRecordingModule(private val activity: ChatActivity) {
         this.enabled = true
     }
 
+    fun updateStreamingMode(isStreamingAsr: Boolean) {
+        this.isStreamingMode = isStreamingAsr
+    }
+
     interface VoiceRecordingListener {
         fun onEnterRecordingMode()
         fun onLeaveRecordingMode()
@@ -239,6 +278,11 @@ class VoiceRecordingModule(private val activity: ChatActivity) {
         fun onRecordSuccess(duration: Float, recordingFilePath: String?)
 
         fun onRecordCanceled()
+
+        fun onStreamingStarted() {}
+        fun onAudioChunkReady(chunkPath: String) {}
+        fun onStreamingFinished() {}
+        fun onStreamingCanceled() {}
     }
 
     companion object {

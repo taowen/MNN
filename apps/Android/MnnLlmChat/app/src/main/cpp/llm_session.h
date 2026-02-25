@@ -44,6 +44,13 @@ public:
 
     void enableAudioOutput(bool b);
 
+    // Streaming ASR methods
+    void StreamingStart(const std::string& prompt_prefix);
+    void PushAudioChunk(const std::string& audio_file);
+    const MNN::Transformer::LlmContext* StreamingFinish(
+        const std::string& prompt_suffix,
+        const std::function<bool(const std::string&, bool is_eop)>& on_progress);
+
     // 新增：API服务历史消息推理方法
     const MNN::Transformer::LlmContext *
     ResponseWithHistory(const std::vector<PromptItem>& full_history,

@@ -154,6 +154,11 @@ public:
     }
     virtual void setWavformCallback(std::function<bool(const float*, size_t, bool)> callback) {}
     virtual void generateWavform() {}
+    virtual bool hasMultimodalContent() const { return false; }
+    // Streaming ASR: incremental prefill then decode
+    virtual void streamingStart(const std::string& prompt_prefix) {}
+    virtual void pushAudioChunk(const std::string& audio_file) {}
+    virtual void streamingFinish(const std::string& prompt_suffix, std::ostream* os = nullptr, const char* end_with = nullptr, int max_new_tokens = -1) {}
 protected:
     void initRuntime();
     void setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg);
@@ -185,10 +190,10 @@ protected:
     friend class EagleGeneration;
     std::vector<Express::VARP> forwardVec(const std::vector<int>& input_ids);
     std::vector<Express::VARP> forwardVec(MNN::Express::VARP input_embeds);
+    void updateContext(int seq_len, int gen_len);
 private:
     std::shared_ptr<Generation> mGenerationStrategy;
     void setSpeculativeConfig();
-    void updateContext(int seq_len, int gen_len);
 private:
     bool mInSpec = false;
     int mDraftLength = 4;

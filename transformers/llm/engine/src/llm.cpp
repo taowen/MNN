@@ -789,7 +789,7 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
 
     mContext->history_tokens.insert(mContext->history_tokens.end(), input_ids.begin(), input_ids.end()); // push to history_ids_
     if(!passExecute) {
-        if (0 == mBlockSize || input_ids.size() <= mBlockSize) {
+        if (0 == mBlockSize || input_ids.size() <= mBlockSize || hasMultimodalContent()) {
             auto hidden_states = embedding(input_ids);
             return generate(hidden_states, max_tokens);
         }

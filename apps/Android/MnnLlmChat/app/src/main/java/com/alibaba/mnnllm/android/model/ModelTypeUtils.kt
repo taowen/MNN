@@ -8,7 +8,8 @@ import com.alibaba.mnnllm.android.modelist.ModelListManager
 object ModelTypeUtils {
 
     fun isAudioModel(modelId: String): Boolean {
-        return modelId.lowercase(Locale.getDefault()).contains("audio") || isOmni(modelId)
+        val lower = modelId.lowercase(Locale.getDefault())
+        return lower.contains("audio") || lower.contains("asr") || isOmni(modelId)
                 || ModelListManager.isAudioModel(modelId)
     }
 

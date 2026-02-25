@@ -69,7 +69,11 @@ Omni::Omni(std::shared_ptr<LlmConfig> config) : Llm(config) {
         mVisionMaxSize = config->config_.value("image_max_size", mVisionMaxSize);
         mVisionGlobal = config->config_.value("global_image", mVisionGlobal);
     }
-    if (config->is_audio()) {}
+    if (config->is_audio()) {
+        mAudioPad = config->config_.value("audio_pad", mAudioPad);
+        mNWindow = config->config_.value("n_window", mNWindow);
+        mNWindowInfer = config->config_.value("n_window_infer", mNWindowInfer);
+    }
 }
 
 bool Omni::load() {
@@ -131,7 +135,14 @@ bool Omni::load() {
         }
     }
     if (mConfig->is_audio()) {
-        mAudioModule.reset(Module::load({}, {}, mConfig->audio_model().c_str(), mProcessorRuntimeManager, &module_config));
+        // QNN Plugin ops models need shapeMutable=false for correct input tensor registration
+        auto audio_path = mConfig->audio_model();
+        Module::Config audio_module_config = module_config;
+        if (audio_path.find("qnn") != std::string::npos) {
+            audio_module_config.shapeMutable = false;
+            audio_module_config.rearrange    = false;
+        }
+        mAudioModule.reset(Module::load({}, {}, audio_path.c_str(), mProcessorRuntimeManager, &audio_module_config));
         if (nullptr == mAudioModule.get()) {
             return false;
         }
@@ -689,32 +700,64 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
     auto input_features  = MNN::AUDIO::whisper_fbank(waveform);
     VARP audio_embedding;
     if (mAudioModule->getInfo()->inputNames.size() > 1) {
-        int seqlen = UP_DIV(input_features->getInfo()->dim[2], 2);
-        constexpr int n_window = 100;
-        std::vector<int> cu_seqlens;
-        int curseq = 0;
-        while (curseq < seqlen) {
-            cu_seqlens.push_back(curseq);
-            curseq += n_window;
-        }
-        if (seqlen % n_window != 0) {
-            cu_seqlens.push_back(seqlen);
-        }
-        VARP attention_mask = _Input({1, seqlen, seqlen}, NCHW, halide_type_of<float>());
-        auto ptr = attention_mask->writeMap<float>();
-        for (int i = 0; i < seqlen; i++) {
-            for (int j = 0; j < seqlen; j++) {
-                ptr[seqlen * i + j] = std::numeric_limits<float>::lowest();
+        int T = input_features->getInfo()->dim[2];
+        if (mNWindowInfer > 0) {
+            // Qwen3-ASR style: per-chunk processing with fixed shapes (QNN compatible)
+            int chunk_frames = mNWindow * 2;
+            // Pad T to multiple of chunk_frames
+            if (T % chunk_frames != 0) {
+                int pad = chunk_frames - (T % chunk_frames);
+                auto zeros = Express::_Const(0.0f, {1, input_features->getInfo()->dim[1], pad}, NCHW);
+                input_features = Express::_Concat({input_features, zeros}, 2);
+                T += pad;
             }
-        }
-        for (size_t i = 1; i < cu_seqlens.size(); ++i) {
-            for (int j = cu_seqlens[i - 1]; j < cu_seqlens[i]; ++j) {
-                for (int k = cu_seqlens[i - 1]; k < cu_seqlens[i]; ++k) {
-                    ptr[seqlen * j + k] = 0;
+            int n_chunks = T / chunk_frames;
+            int tokens_per_chunk = chunk_frames;
+            for (int i = 0; i < 3; i++) {
+                tokens_per_chunk = (tokens_per_chunk + 1) / 2;
+            }
+            // Fixed-shape attention mask: all zeros = full attention within single chunk
+            VARP chunk_mask = _Input({1, tokens_per_chunk, tokens_per_chunk}, NCHW, halide_type_of<float>());
+            ::memset(chunk_mask->writeMap<float>(), 0,
+                     tokens_per_chunk * tokens_per_chunk * sizeof(float));
+            std::vector<VARP> chunk_embeddings;
+            for (int c = 0; c < n_chunks; c++) {
+                auto chunk_features = _Slice(input_features,
+                    _var<int>({0, 0, c * chunk_frames}, {3}),
+                    _var<int>({1, -1, chunk_frames}, {3}));
+                auto chunk_embed = mAudioModule->onForward({chunk_features, chunk_mask})[0];
+                chunk_embeddings.push_back(chunk_embed);
+            }
+            audio_embedding = _Concat(chunk_embeddings, 1);
+        } else {
+            // Qwen2.5-Omni style: Conv1D with 2x downsampling, windowed attention
+            int seqlen = UP_DIV(T, 2);
+            int n_window_tokens = 100;
+            std::vector<int> cu_seqlens;
+            int curseq = 0;
+            while (curseq < seqlen) {
+                cu_seqlens.push_back(curseq);
+                curseq += n_window_tokens;
+            }
+            if (seqlen % n_window_tokens != 0) {
+                cu_seqlens.push_back(seqlen);
+            }
+            VARP attention_mask = _Input({1, seqlen, seqlen}, NCHW, halide_type_of<float>());
+            auto ptr = attention_mask->writeMap<float>();
+            for (int i = 0; i < seqlen; i++) {
+                for (int j = 0; j < seqlen; j++) {
+                    ptr[seqlen * i + j] = std::numeric_limits<float>::lowest();
                 }
             }
+            for (size_t i = 1; i < cu_seqlens.size(); ++i) {
+                for (int j = cu_seqlens[i - 1]; j < cu_seqlens[i]; ++j) {
+                    for (int k = cu_seqlens[i - 1]; k < cu_seqlens[i]; ++k) {
+                        ptr[seqlen * j + k] = 0;
+                    }
+                }
+            }
+            audio_embedding = mAudioModule->onForward({input_features, attention_mask})[0];
         }
-        audio_embedding = mAudioModule->onForward({input_features, attention_mask})[0];
     } else {
         // Qwen2-Audio just support audio time <= 30s
         if (input_features->getInfo()->dim[2] > 3000) {
@@ -892,6 +935,10 @@ std::vector<int> Omni::processAudioContent(const std::string& content, const std
     return multimodeProcess("audio", content);
 }
 
+bool Omni::hasMultimodalContent() const {
+    return !mAudioEmbeddings.empty() || !mVisionEmbeddings.empty();
+}
+
 VARP Omni::embedding(const std::vector<int>& input_ids) {
     if (input_ids.size() == 1) {
         if (mConfig->has_deepstack() && mExtraArgs.size() == 1) {
@@ -1034,6 +1081,148 @@ void Omni::response(const std::vector<int>& input_ids, std::ostream* os, const c
         mTalker->generate_init();
     }
     generate(input_ids, max_new_tokens);
+}
+
+void Omni::streamingStart(const std::string& prompt_prefix) {
+    generate_init(nullptr, nullptr);
+    mPositionIds.clear();
+    auto prefix_ids = mTokenizer->encode(prompt_prefix);
+    addPositionIds(prefix_ids.size());
+    mContext->history_tokens.insert(mContext->history_tokens.end(), prefix_ids.begin(), prefix_ids.end());
+    auto embed = Llm::embedding(prefix_ids);
+    Timer _t;
+    forwardVec(embed);
+    updateContext(prefix_ids.size(), 0);
+    mContext->prefill_us += _t.durationInUs();
+    mContext->prompt_len = prefix_ids.size();
+    MNN_PRINT("streaming: prefix prefilled, %d tokens, all_seq_len=%d\n",
+              (int)prefix_ids.size(), mContext->all_seq_len);
+}
+
+void Omni::pushAudioChunk(const std::string& audio_file) {
+#ifdef LLM_SUPPORT_AUDIO
+    constexpr int sample_rate = 16000;
+    auto load_res = MNN::AUDIO::load(audio_file, sample_rate);
+    VARP waveform = load_res.first;
+    if (waveform == nullptr) {
+        MNN_PRINT("streaming: can't open audio: %s\n", audio_file.c_str());
+        return;
+    }
+    mContext->audio_input_s += (float)(waveform->getInfo()->size) / sample_rate;
+
+    Timer _t;
+    auto input_features = MNN::AUDIO::whisper_fbank(waveform);
+    int T = input_features->getInfo()->dim[2];
+
+    VARP audio_embedding;
+    if (mAudioModule->getInfo()->inputNames.size() > 1) {
+        if (mNWindowInfer > 0) {
+            // Qwen3-ASR style: per-chunk processing with fixed shapes (QNN compatible)
+            int chunk_frames = mNWindow * 2;
+            if (T % chunk_frames != 0) {
+                int pad = chunk_frames - (T % chunk_frames);
+                auto zeros = Express::_Const(0.0f, {1, input_features->getInfo()->dim[1], pad}, NCHW);
+                input_features = Express::_Concat({input_features, zeros}, 2);
+                T += pad;
+            }
+            int n_chunks = T / chunk_frames;
+            int tokens_per_chunk = chunk_frames;
+            for (int i = 0; i < 3; i++) {
+                tokens_per_chunk = (tokens_per_chunk + 1) / 2;
+            }
+            VARP chunk_mask = _Input({1, tokens_per_chunk, tokens_per_chunk}, NCHW, halide_type_of<float>());
+            ::memset(chunk_mask->writeMap<float>(), 0,
+                     tokens_per_chunk * tokens_per_chunk * sizeof(float));
+            std::vector<VARP> chunk_embeddings;
+            for (int c = 0; c < n_chunks; c++) {
+                auto chunk_features = _Slice(input_features,
+                    _var<int>({0, 0, c * chunk_frames}, {3}),
+                    _var<int>({1, -1, chunk_frames}, {3}));
+                auto chunk_embed = mAudioModule->onForward({chunk_features, chunk_mask})[0];
+                chunk_embeddings.push_back(chunk_embed);
+            }
+            audio_embedding = _Concat(chunk_embeddings, 1);
+        } else {
+            // Qwen2.5-Omni style: Conv1D with 2x downsampling, windowed attention
+            int seqlen = UP_DIV(T, 2);
+            int n_window_tokens = 100;
+            std::vector<int> cu_seqlens;
+            int curseq = 0;
+            while (curseq < seqlen) {
+                cu_seqlens.push_back(curseq);
+                curseq += n_window_tokens;
+            }
+            if (seqlen % n_window_tokens != 0) {
+                cu_seqlens.push_back(seqlen);
+            }
+            VARP attention_mask = _Input({1, seqlen, seqlen}, NCHW, halide_type_of<float>());
+            auto ptr = attention_mask->writeMap<float>();
+            for (int i = 0; i < seqlen; i++) {
+                for (int j = 0; j < seqlen; j++) {
+                    ptr[seqlen * i + j] = std::numeric_limits<float>::lowest();
+                }
+            }
+            for (size_t i = 1; i < cu_seqlens.size(); ++i) {
+                for (int j = cu_seqlens[i - 1]; j < cu_seqlens[i]; ++j) {
+                    for (int k = cu_seqlens[i - 1]; k < cu_seqlens[i]; ++k) {
+                        ptr[seqlen * j + k] = 0;
+                    }
+                }
+            }
+            audio_embedding = mAudioModule->onForward({input_features, attention_mask})[0];
+        }
+    } else {
+        if (input_features->getInfo()->dim[2] > 3000) {
+            input_features = _Slice(input_features, _var<int>({0, 0, 0}, {3}), _var<int>({-1, -1, 3000}, {3}));
+        }
+        audio_embedding = mAudioModule->forward(input_features);
+    }
+    audio_embedding = _Permute(audio_embedding, {1, 0, 2});
+    mContext->audio_us += _t.durationInUs();
+
+    int embed_len = audio_embedding->getInfo()->dim[0];
+    addPositionIds(embed_len);
+    // Add placeholder audio pad tokens to history
+    std::vector<int> audio_ids(embed_len, mAudioPad);
+    mContext->history_tokens.insert(mContext->history_tokens.end(), audio_ids.begin(), audio_ids.end());
+
+    Timer _t2;
+    forwardVec(audio_embedding);
+    updateContext(embed_len, 0);
+    mContext->prefill_us += _t2.durationInUs();
+    mContext->prompt_len += embed_len;
+
+    MNN_PRINT("streaming: chunk done, %d audio tokens prefilled, total seq_len=%d\n",
+              embed_len, mContext->all_seq_len);
+#else
+    MNN_PRINT("streaming: audio support not compiled\n");
+#endif
+}
+
+void Omni::streamingFinish(const std::string& prompt_suffix, std::ostream* os, const char* end_with, int max_new_tokens) {
+    auto suffix_ids = mTokenizer->encode(prompt_suffix);
+    addPositionIds(suffix_ids.size());
+    mContext->history_tokens.insert(mContext->history_tokens.end(), suffix_ids.begin(), suffix_ids.end());
+    auto embed = Llm::embedding(suffix_ids);
+    Timer _t;
+    forwardVec(embed);
+    updateContext(suffix_ids.size(), 0);
+    mContext->prefill_us += _t.durationInUs();
+    mContext->prompt_len += suffix_ids.size();
+
+    MNN::Express::ExecutorScope::Current()->gc();
+
+    // Set ostream for decode phase
+    mContext->os = os;
+    if (end_with) {
+        mContext->end_with = end_with;
+    }
+
+    MNN_PRINT("streaming: suffix prefilled, %d tokens, total prompt_len=%d, starting decode\n",
+              (int)suffix_ids.size(), mContext->prompt_len);
+
+    // Generate first token to kick off decode
+    generate(1);
 }
 
 void Omni::setWavformCallback(std::function<bool(const float*, size_t, bool)> callback) {

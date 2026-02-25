@@ -290,6 +290,55 @@ void LlmSession::enableAudioOutput(bool enable) {
     enable_audio_output_ = enable;
 }
 
+void LlmSession::StreamingStart(const std::string& prompt_prefix) {
+    stop_requested_ = false;
+    generate_text_end_ = false;
+    llm_->streamingStart(prompt_prefix);
+}
+
+void LlmSession::PushAudioChunk(const std::string& audio_file) {
+    llm_->pushAudioChunk(audio_file);
+}
+
+const MNN::Transformer::LlmContext* LlmSession::StreamingFinish(
+    const std::string& prompt_suffix,
+    const std::function<bool(const std::string&, bool is_eop)>& on_progress) {
+    if (llm_ == nullptr) {
+        return nullptr;
+    }
+    std::stringstream response_buffer;
+    mls::Utf8StreamProcessor processor([&response_buffer, &on_progress, this](const std::string& utf8Char) {
+        bool is_eop = utf8Char.find("<eop>") != std::string::npos;
+        if (!is_eop) {
+            response_buffer << utf8Char;
+        } else {
+            std::string response_result = response_buffer.str();
+            MNN_DEBUG("StreamingFinish Result %s", response_result.c_str());
+            response_string_for_debug = response_result;
+        }
+        if (on_progress) {
+            bool user_stop_requested = on_progress(utf8Char, is_eop);
+            generate_text_end_ = is_eop;
+            stop_requested_ = user_stop_requested;
+        }
+    });
+    LlmStreamBuffer stream_buffer{[&processor](const char* str, size_t len) {
+        processor.processStream(str, len);
+    }};
+    std::ostream output_ostream(&stream_buffer);
+
+    // Prefill suffix + generate first token
+    llm_->streamingFinish(prompt_suffix, &output_ostream, "<eop>", 1);
+
+    // Decode loop
+    int current_size = 1;
+    while (!stop_requested_ && !generate_text_end_ && current_size < max_new_tokens_) {
+        llm_->generate(1);
+        current_size++;
+    }
+    return llm_->getContext();
+}
+
 const MNN::Transformer::LlmContext * LlmSession::ResponseWithHistory(
         const std::vector<PromptItem>& full_history,
         const std::function<bool(const std::string&, bool is_eop)>& on_progress) {
