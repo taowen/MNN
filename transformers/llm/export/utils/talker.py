@@ -33,6 +33,7 @@ class Talker(torch.nn.Module):
     def get_talker(model_type):
         audio_models = {
             'qwen2_5_omni': Qwen2_5OmniTalker,
+            'funaudiochat': FunAudioChatTalker,
         }
         if model_type in audio_models:
             return audio_models[model_type]
@@ -242,5 +243,176 @@ class Qwen2_5OmniTalker(Talker):
                         "inputs_embeds": { 1: "size" },
                         "attention_mask": { 2: "size", 3: "size" },
                         "position_ids": { 2: "size" }
+                    })
+        return talker_onnx
+
+class FunAudioChatTalker(Talker):
+    def __init__(self, talker, token2wav, base):
+        # Don't call super().__init__ because it expects token2wav to be valid
+        # and tries to create Qwen2_5OmniToken2Wav
+        torch.nn.Module.__init__(self)
+        self.model_type = base.config.model_type
+        self.thinker_embed = base.embed
+        self.args = base.args
+        self.talker = talker.float()
+        from .token2wav import CosyVoice3Token2Wav
+        cosyvoice_model_path = '/home/taowen/Fun-Audio-Chat/pretrained_models/Fun-CosyVoice3-0.5B-2512'
+        self.token2wav = CosyVoice3Token2Wav(base.args, cosyvoice_model_path)
+        self.config = base.config
+        self.input_hidden_size = base.config.hidden_size  # 4096 (thinker hidden size)
+        self.llm_config = { 'has_talker': True }
+        self.rope_ratio = 1.0
+        self.quant_bit = 4
+        self.talker_embeds = []
+        self.seq_len = 0
+        self.token_len = 0
+        # Use origin_config (full HuggingFace config) since LlmConfig
+        # doesn't preserve nested audio_config.crq_transformer_config
+        origin_config = getattr(base.config, 'origin_config', base.config)
+        # Get group_size from audio config
+        self.group_size = 5
+        if hasattr(origin_config, 'audio_config') and hasattr(origin_config.audio_config, 'group_size'):
+            self.group_size = origin_config.audio_config.group_size
+        # CRQ config from audio_config.crq_transformer_config
+        audio_config = getattr(origin_config, 'audio_config', origin_config)
+        crq_config = getattr(audio_config, 'crq_transformer_config', None)
+        if crq_config is None:
+            crq_config = audio_config
+        def _cfg(key, default):
+            if isinstance(crq_config, dict):
+                return crq_config.get(key, default)
+            return getattr(crq_config, key, default)
+        # Set CRQ config directly on self so Decoder/Attention can read them
+        self.hidden_size = _cfg('hidden_size', 1024)
+        self.num_attention_heads = _cfg('num_attention_heads', 16)
+        self.num_key_value_heads = _cfg('num_key_value_heads', 8)
+        self.num_hidden_layers = _cfg('num_hidden_layers', 28)
+        self.head_dim = _cfg('head_dim', 128)
+        self.rope_theta = _cfg('rope_theta', 1000000)
+        self.rope_scaling = None  # Standard rotary, no scaling
+        # Codec token IDs
+        self.codec_bos = getattr(audio_config, 'bos_token_id', 6561)
+        self.codec_eos = getattr(audio_config, 'eos_token_id', 6562)
+        self.codec_pad = getattr(audio_config, 'pad_token_id', 6563)
+        self.codebook_size = getattr(audio_config, 'codebook_size', 6565)
+        self.init_config()
+        self.load()
+
+    def get_config(self):
+        return self.llm_config
+
+    def init_config(self):
+        self.llm_config.update({
+            'codec_group_size': self.group_size,
+            'codec_bos': self.codec_bos,
+            'codec_eos': self.codec_eos,
+            'codec_pad': self.codec_pad,
+        })
+
+    def load(self):
+        self.model_map = {
+            'config': {
+                'hidden_size': 'hidden_size',
+                'head_dim': 'head_dim',
+                'num_attention_heads': 'num_attention_heads',
+                'num_hidden_layers': 'num_hidden_layers',
+                'num_key_value_heads': 'num_key_value_heads',
+            },
+            'decoder': {
+                'self_attn': 'self_attn',
+                'mlp': 'mlp',
+                'input_layernorm': 'input_layernorm',
+                'post_attention_layernorm': 'post_attention_layernorm'
+            },
+            'attention': {
+                'q_proj': 'q_proj',
+                'k_proj': 'k_proj',
+                'v_proj': 'v_proj',
+                'o_proj': 'o_proj',
+                'q_norm': 'q_norm',
+                'k_norm': 'k_norm'
+            }
+        }
+        # Standard 1D rotary (NOT MRoPE)
+        self.rotary = Rotary(self)
+        # CRQ transformer is a Qwen3Model with .layers directly
+        crq = self.talker.crq_transformer
+        self.blocks = []
+        for i, block in enumerate(crq.layers):
+            decoder = Decoder(block, i, self)
+            decoder.self_attn.export_fused_attn = True
+            self.blocks.append(decoder)
+        # Codec embedding from lm_head.weight (shape [codebook_size, input_hidden_size])
+        self.embed = torch.nn.Embedding(self.codebook_size, self.input_hidden_size)
+        self.embed.weight = self.talker.lm_head.weight
+
+    def forward(self, inputs_embeds, attention_mask, position_ids):
+        # inputs_embeds: [1, seq, input_hidden_size(4096)]
+        hidden_states = self.talker.input_matching(inputs_embeds)  # [1, seq, hidden_size(1024)]
+        rotary_pos_emb = self.rotary(position_ids)
+        for i in range(len(self.blocks)):
+            hidden_states = self.blocks[i](hidden_states, rotary_pos_emb, attention_mask)
+        hidden_states = hidden_states[:, -1, :]
+        hidden_states = self.talker.crq_transformer.norm(hidden_states)
+        hidden_states = self.talker.output_matching(hidden_states)  # [input_hidden_size(4096)]
+        logits = self.talker.lm_head(hidden_states)  # [codebook_size]
+        return logits
+
+    def get_position_ids(self) -> torch.Tensor:
+        # Standard 1D position ids (NOT MRoPE)
+        if self.token_len:
+            position_ids = torch.tensor([[self.seq_len - 1]], dtype=torch.int)
+        else:
+            position_ids = torch.arange(self.seq_len, dtype=torch.int).unsqueeze(0)
+        return position_ids
+
+    def get_attention_mask(self) -> torch.Tensor:
+        if self.token_len:
+            return torch.zeros([1, 1, 1, self.seq_len], dtype=torch.float32)
+        return (1 - torch.tril(torch.ones([1, 1, self.seq_len, self.seq_len]))) * torch.finfo(torch.float32).min
+
+    def export_embed(self):
+        import ctypes
+        # Export codec embeddings (from lm_head.weight)
+        tensor_data = self.embed.weight.data.bfloat16()
+        data_ptr = tensor_data.untyped_storage().data_ptr()
+        buffer = (ctypes.c_byte * (tensor_data.numel() * 2)).from_address(data_ptr)
+        embedding_file = f'{self.args.dst_path}/talker_embeddings_bf16.bin'
+        with open(embedding_file, 'wb') as f:
+            f.write(buffer)
+        # Export pre_matching weights
+        pre_matching_weight = self.talker.pre_matching.weight.data.bfloat16()
+        pre_matching_bias = self.talker.pre_matching.bias.data.bfloat16()
+        weight_ptr = pre_matching_weight.untyped_storage().data_ptr()
+        weight_buf = (ctypes.c_byte * (pre_matching_weight.numel() * 2)).from_address(weight_ptr)
+        bias_ptr = pre_matching_bias.untyped_storage().data_ptr()
+        bias_buf = (ctypes.c_byte * (pre_matching_bias.numel() * 2)).from_address(bias_ptr)
+        pre_matching_file = f'{self.args.dst_path}/pre_matching_bf16.bin'
+        with open(pre_matching_file, 'wb') as f:
+            f.write(weight_buf)
+            f.write(bias_buf)
+        return embedding_file
+
+    def add_talker_embeds(self, talker_embed):
+        self.talker_embeds.append(talker_embed)
+
+    @spinner_run(f'export talker to ')
+    def export(self, onnx_path):
+        self.export_embed()
+        self.seq_len = 3
+        self.token_len = 0
+        # Input is [1, seq, input_hidden_size(4096)]
+        inputs_embeds = torch.randn([1, self.seq_len, self.input_hidden_size])
+        position_ids = self.get_position_ids()
+        attention_mask = self.get_attention_mask()
+        talker_onnx = f'{onnx_path}/talker.onnx'
+        onnx_export(self, (inputs_embeds, attention_mask, position_ids),
+                    talker_onnx,
+                    input_names=['inputs_embeds', 'attention_mask', 'position_ids'],
+                    output_names=['logits'],
+                    dynamic_axes={
+                        "inputs_embeds": { 1: "size" },
+                        "attention_mask": { 2: "size", 3: "size" },
+                        "position_ids": { 1: "size" }
                     })
         return talker_onnx

@@ -711,7 +711,8 @@ class ModelMapper:
             'final_layernorm': 'language_model.model.norm',
             'audio': 'continuous_audio_tower',
             'audio.audio_tower': 'audio_tower',
-            'audio.audio_invert_tower': 'audio_invert_tower'
+            'audio.audio_invert_tower': 'audio_invert_tower',
+            'talker': 'audio_invert_tower',
         }
         qwen3_attention = {
             'q_proj': 'q_proj',

@@ -270,11 +270,17 @@ class LlmExporter(torch.nn.Module):
             if self.args.embed_bit < 16:
                 config['embedding_file'] = f"embeddings_int{self.args.embed_bit}.bin"
             if hasattr(self, 'talker') and self.talker is not None:
-                config['system_prompt'] = "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
-                config['talker_max_new_tokens'] = 2048
-                config['talker_speaker'] = "Chelsie"
-                config['dit_steps'] = 5
-                config['dit_solver'] = 1
+                if self.talker.token2wav is not None:
+                    config['talker_max_new_tokens'] = 2048
+                    config['dit_solver'] = 1
+                    if self.model_type == 'funaudiochat':
+                        config['system_prompt'] = "You are a helpful assistant."
+                        config['talker_speaker'] = "中文女"
+                        config['dit_steps'] = 10
+                    else:
+                        config['system_prompt'] = "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
+                        config['talker_speaker'] = "Chelsie"
+                        config['dit_steps'] = 5
             if self.model_type == "gemma3":
                 config.update({'precision': "normal"})
             if (hasattr(self, 'visual') and self.visual is not None) or (hasattr(self, 'visual') and self.audio is not None):
@@ -496,12 +502,14 @@ class LlmExporter(torch.nn.Module):
         if self.talker is None:
             return
         talker_onnx = self.talker.export(self.onnx_path)
-        predit_onnx, dit_onnx, bigvgan_onnx = self.talker.token2wav.export(self.onnx_path)
         if self.mnn_converter:
             self.mnn_converter.export(talker_onnx, self.talker.quant_bit)
-            self.mnn_converter.export(predit_onnx, self.talker.token2wav.quant_bit)
-            self.mnn_converter.export(dit_onnx, self.talker.token2wav.quant_bit)
-            self.mnn_converter.export(bigvgan_onnx, self.talker.token2wav.quant_bit)
+        if self.talker.token2wav is not None:
+            predit_onnx, dit_onnx, bigvgan_onnx = self.talker.token2wav.export(self.onnx_path)
+            if self.mnn_converter:
+                self.mnn_converter.export(predit_onnx, self.talker.token2wav.quant_bit)
+                self.mnn_converter.export(dit_onnx, self.talker.token2wav.quant_bit)
+                self.mnn_converter.export(bigvgan_onnx, self.talker.token2wav.quant_bit)
 
     def export_language(self):
         # export_embedding

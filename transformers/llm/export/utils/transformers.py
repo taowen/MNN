@@ -163,6 +163,10 @@ class Attention(torch.nn.Module):
             attn_output = self.fused_attn(query_states, key_states, value_states, attention_mask)
             if gate is not None:
                 attn_output = attn_output * torch.sigmoid(gate)
+            # Explicit reshape using hidden_states-derived dims, not fused_attn output shape.
+            # MNN FusedAttention changes output layout from [B,S,H*D] to [B,H,S,D] at runtime,
+            # which breaks downstream Shape-based reshapes when hidden_size != num_heads*head_dim.
+            attn_output = attn_output.view(bsz, q_len, -1)
             attn_output = self.o_proj(attn_output)
             return attn_output
 

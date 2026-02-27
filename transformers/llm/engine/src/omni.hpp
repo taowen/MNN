@@ -65,6 +65,7 @@ public:
     virtual Express::VARP gen_position_ids(int seq_len) override;
     virtual int sample(Express::VARP logits, int offset = 0, int size = 0) override;
     virtual void setWavformCallback(std::function<bool(const float*, size_t, bool)> callback) override;
+    virtual std::vector<Express::VARP> forwardRaw(Express::VARP hiddenState, Express::VARP mask, Express::VARP inputPos, Express::VARPS extraArgs = {}) override;
     VARP ditForward(const int codec_size, const int* codec_tokens, const float* initial_noise = nullptr);
     VARP bigvganForward(VARP mel);
     VARP token2wav(const std::vector<int>& codec_tokens);
@@ -77,20 +78,25 @@ public:
     // is decode with token2wav
     bool mStreamWithDecode = false;
 private:
+    int mCodecGroupSize = 1;
     int mMaxNewTokens = 2048, mTextBosToken = 151872, mTextEosToken = 151861,
-        mTextPadToken = 151859, mCodecBosToken = 8293, mCodecPadToken = 8292;
+        mTextPadToken = 151859, mCodecBosToken = 8293, mCodecEosToken = 8294, mCodecPadToken = 8292;
+    bool mUseMRoPE = true;
     VARP mTextBos, mTextEos, mTextPad, mCodecBos, mCodecPad, mSpk, mCond;
+    std::vector<int> mPromptTokens;
     MropeInfo mPositionIds;
     std::vector<VARP> mTalkerEmbeds;
     std::shared_ptr<Module> mPreDit, mDit, mBigvgan;
     Llm* mThinker;
+    VARP mPreMatchingWeight, mPreMatchingBias;
     // stream generate
     std::vector<float> mInitialNoise, mWaveformBuffer;
     VARP mMelBuffer = nullptr;
     const int dit_chunk_size = 60, dit_left_context = 24,
         dit_right_context = 12, dit_right_padding = dit_right_context,
         vocoder_left_context = 8, vocoder_right_context = 8,
-        vocoder_right_pad = vocoder_right_context, vocoder_upsample_rate = 240;
+        vocoder_right_pad = vocoder_right_context;
+    int vocoder_upsample_rate = 240;
     int dit_left_padding = 0, dit_start_index = 0, vocoder_left_pad = 0;
     std::function<bool(const float*, size_t, bool)> mWavformCallback = nullptr;
 };

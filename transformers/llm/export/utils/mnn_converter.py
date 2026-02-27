@@ -139,6 +139,7 @@ class MNNConverter:
             if quant_bit == 32:
                 quant_args = []
             self.onnx2mnn(self.onnx_model_path, self.mnn_model_path, quant_args, transformer_fuse=transformer_fuse, group_conv_native=group_conv_native, weight_sym=weight_sym)
+            self.rebuild_extra_ops()
         else:
             mnn_json = f'{self.mnn_model_path}.json'
             self.onnx2mnn(self.onnx_model_path, self.mnn_model_path, transformer_fuse=transformer_fuse, group_conv_native=group_conv_native, weight_sym=weight_sym)
@@ -432,6 +433,30 @@ class MNNConverter:
             "defaultDimentionFormat": "NHWC"
         }
         return [fused_attention]
+
+    def rebuild_extra_ops(self):
+        """Convert FusedAttention Extra ops to native Attention without touching weights."""
+        mnn_json = f'{self.mnn_model_path}.json'
+        self.mnn2json(self.mnn_model_path, mnn_json)
+        with open(mnn_json) as f:
+            graph = json.load(f)
+        modified = False
+        new_ops = []
+        for op in graph.get('oplists', []):
+            if op.get('type') == 'Extra' and op.get('main', {}).get('type') in ('FusedAttention', 'FusedLinearAttention'):
+                op_type = op['main']['type']
+                if op_type == 'FusedAttention':
+                    new_ops += self.rebuild_attnention(op, graph)
+                else:
+                    new_ops += self.rebuild_linear_attnention(op, graph)
+                modified = True
+            else:
+                new_ops.append(op)
+        if modified:
+            graph['oplists'] = new_ops
+            with open(mnn_json, 'w', encoding='utf-8') as f:
+                json.dump(graph, f, ensure_ascii=False, indent=4)
+            self.json2mnn(mnn_json, self.mnn_model_path)
 
     def rebuild_linear_attnention(self, op, graph):
         attrs = op['main']['attr']

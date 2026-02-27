@@ -149,7 +149,8 @@ class LlmModel(PreTrainedModel):
             model.audio = Audio.get_audio(model.audio.config.model_type)(model.audio, model)
         if hasattr(model, 'talker') and model.talker is not None:
             from utils.talker import Talker
-            model.talker = Talker.get_talker(model_type)(model.talker, model.token2wav, model)
+            token2wav = getattr(model, 'token2wav', None)
+            model.talker = Talker.get_talker(model_type)(model.talker, token2wav, model)
         if model_type == 'poi_qwen2_mtp':
             model.mtp = [model.mtp1, model.mtp2]
         if model.mtp is not None:
@@ -200,7 +201,7 @@ class LlmModel(PreTrainedModel):
 
         talker_embeds = None
         if hasattr(self, 'talker') and self.talker is not None:
-            talker_embeds = self.final_layernorm(hidden_states) + input_ids.permute([1, 0, 2])
+            talker_embeds = self.final_layernorm(hidden_states).permute([1, 0, 2]) + input_ids.permute([1, 0, 2])
             self.talker.add_talker_embeds(talker_embeds)
 
         final_layernorm = hidden_states

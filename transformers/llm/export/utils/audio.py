@@ -277,9 +277,11 @@ class Qwen2_5OmniAudio(Qwen2Audio):
 class FunAudioChatAudio(Qwen2_5OmniAudio):
     def __init__(self, audio, base):
         super().__init__(audio, base)
-        self.audio_pad_id = 151669
 
     def load(self):
+        # Set audio_pad_id before super().load() (Audio.__init__ calls load()
+        # before Qwen2Audio.__init__ finishes setting audio_pad_id)
+        self.audio_pad_id = 151669
         # model
         self.audio = self.audio.float()
         self.audio_tower = self.audio.audio_tower.float()
@@ -287,6 +289,7 @@ class FunAudioChatAudio(Qwen2_5OmniAudio):
         self.group_size = self.audio.config.group_size
         # call parent load
         super().load()
+        self.llm_config['audio_pad'] = self.audio_pad_id
 
     def forward(self, input_features, attention_mask = None):
         # call parent forward to get audio_features before group pooling

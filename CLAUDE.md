@@ -269,3 +269,95 @@ adb_broadcast("load", model_dir="...", config_file="config_qnn.json")
 ```
 Test script: `--config config_qnn.json` flag in `test_qwen3_asr.py`
 
+## Fun-Audio-Chat S2S Pipeline
+
+### Architecture
+Fun-Audio-Chat is a Speech-to-Speech model with 4 stages:
+1. **Audio Encoder** (Whisper-like, 32 layers) — speech → embeddings
+2. **LLM Thinker** (Qwen3-8B, 36 layers) — generates text + hidden states
+3. **CRQ Talker** (Qwen3, 28 layers, hidden=1024) — hidden states → codec tokens (group_size=5)
+4. **CosyVoice3** (DiT 22 layers + HIFT vocoder) — codec tokens → waveform
+
+### Exported Files
+| File | Size | Description |
+|------|------|-------------|
+| `llm.mnn` + `.weight` | 4.5 GB | Qwen3-8B thinker (q4) |
+| `audio.mnn` + `.weight` | 420 MB | Audio encoder |
+| `talker.mnn` + `.weight` | 286 MB | CRQ talker (28-layer Qwen3) |
+| `predit.mnn` + `.weight` | 5.5 MB | DiT preprocessing (token embed, upsample, RoPE, mask) |
+| `dit.mnn` + `.weight` | 373 MB | 22-layer DiT (flow matching, 10 Euler steps) |
+| `bigvgan.mnn` + `.weight` | 280 MB | HIFT vocoder (mel → waveform) |
+| `spk_dict.mnn` | 583 KB | Speaker embeddings + prompt tokens |
+| `embeddings_int8.bin` | 668 MB | LLM token embeddings |
+| `talker_embeddings_bf16.bin` | 52 MB | Talker codec embeddings |
+| `pre_matching_bf16.bin` | 161 MB | Pre-matching projection weights |
+
+### Export Command
+```bash
+source transformers/llm/export/.venv/bin/activate
+PYTHONPATH=/home/taowen/Fun-Audio-Chat:$PYTHONPATH python3 transformers/llm/export/llmexport.py \
+  --path /home/taowen/Fun-Audio-Chat/pretrained_models/Fun-Audio-Chat-8B \
+  --dst_path /home/taowen/MNN/Fun-Audio-Chat-MNN \
+  --quant_bit 4 --embed_bit 8 --export mnn
+```
+
+### Android Deployment (llm_demo CLI)
+```bash
+# Build for Android ARM64
+cd build_android64
+cmake .. \
+  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_SDK/ndk/27.2.12479018/build/cmake/android.toolchain.cmake \
+  -DCMAKE_BUILD_TYPE=Release -DANDROID_ABI=arm64-v8a -DANDROID_NATIVE_API_LEVEL=28 \
+  -DMNN_BUILD_LLM=ON -DMNN_BUILD_LLM_OMNI=ON -DMNN_ARM82=ON \
+  -DMNN_LOW_MEMORY=ON -DMNN_SUPPORT_BF16=ON -DMNN_BUILD_SHARED_LIBS=ON \
+  -DMNN_SEP_BUILD=ON -DMNN_SUPPORT_TRANSFORMER_FUSE=ON
+make -j$(nproc)
+
+# Push to device
+adb push build_android64/llm_demo /data/local/tmp/
+adb push build_android64/OFF/arm64-v8a/libMNN.so /data/local/tmp/
+adb push build_android64/OFF/arm64-v8a/libllm.so /data/local/tmp/
+adb push build_android64/express/OFF/arm64-v8a/libMNN_Express.so /data/local/tmp/
+adb push build_android64/tools/cv/OFF/arm64-v8a/libMNNOpenCV.so /data/local/tmp/
+adb push build_android64/tools/audio/OFF/arm64-v8a/libMNNAudio.so /data/local/tmp/
+adb shell chmod +x /data/local/tmp/llm_demo
+adb push Fun-Audio-Chat-MNN/ /data/local/tmp/Fun-Audio-Chat-MNN/
+
+# Run
+adb shell "cd /data/local/tmp/Fun-Audio-Chat-MNN && LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/llm_demo config.json prompt.txt"
+```
+- Output WAV saved as `output.wav` in the model directory (24kHz, mono, 16-bit PCM)
+- Android NDK: `/home/taowen/android-sdk/ndk/27.2.12479018`
+- Must use `MNN_SEP_BUILD=ON` for Android (OFF causes CMake POST_BUILD errors with OBJECT libs)
+
+### Key Implementation Details
+
+#### FusedAttention → Native Attention Conversion
+ONNX exports use custom `FusedAttention` Extra ops. MNN's `rebuild_attnention()` converts them to native `Attention` ops, but **only runs when `weight_ops is not None`** (main LLM path). For talker/token2wav exports (`weight_ops=None`), added `rebuild_extra_ops()` in `mnn_converter.py` that does JSON round-trip conversion after `onnx2mnn`.
+
+#### CRQ Talker hidden_size ≠ num_heads*head_dim
+CRQ has hidden_size=1024, num_heads=16, head_dim=128 → output_dim=2048. Added explicit `.view(bsz, q_len, -1)` before `o_proj` in `transformers.py` to avoid MNN Reshape errors when FusedAttention changes output layout from `[B,S,H*D]` to `[B,H,S,D]`.
+
+#### Predit spk Shape Fix
+The predit ONNX export used `spk` dummy as `[1, 1, 192]` (3D) with a `.squeeze(1)` in forward(). This baked a Squeeze op into the graph. C++ runtime provides `[1, 192]` (2D) from spk_dict.mnn, causing `Cannot Squeeze dim[1], 1 is expected, 192 is got`. Fix: changed dummy to `[1, 192]` and removed `.squeeze(1)` in `CosyVoice3DitPreprocess.forward()`.
+
+#### codec_group_size in C++ Runtime
+FunAudioChat generates 5 codec tokens per LLM text token (vs Qwen2.5-Omni's 1:1). Key adaptations in `omni.cpp`:
+- `mCodecGroupSize` config-driven (from `codec_group_size` in config.json)
+- `Talker::forwardRaw()` skips `logitsIndex` input for CRQ (3-input model vs 4-input)
+- `Talker::gen_position_ids()` uses 1D positions (not MRoPE) when `mCodecGroupSize > 1`
+- Pre-matching: `hidden_states * pre_matching_weight + bias` → reshape to `[1, group_size, hidden]`
+- gen_seq_len/all_seq_len manually incremented (CRQ bypasses `Llm::generate()`)
+
+#### Dit Components shapeMutable
+predit/dit/bigvgan use `shapeMutable = (mCodecGroupSize > 1)`: `true` for CosyVoice3 (dynamic codec lengths), `false` for Qwen2.5-Omni (preserves original behavior). CRQ talker always uses `shapeMutable=false` for KV cache.
+
+### Config Keys (llmconfig.hpp / config.json)
+- `has_talker`: bool — enable/disable talker loading
+- `talker_speaker`: string — speaker name in spk_dict (e.g. "中文女")
+- `codec_group_size`: int — codec tokens per text token (5 for FunAudioChat, 1 for Qwen2.5-Omni)
+- `codec_bos/eos/pad`: int — codec token IDs (6561/6562/6563 for FunAudioChat)
+- `talker_layer_nums`: int — CRQ transformer layers (28)
+- `dit_steps`: int — flow matching Euler steps (10 for CosyVoice3, 5 for Qwen2.5-Omni)
+- `dit_solver`: int — 1 for Euler, 4 for RK4
+

@@ -1069,7 +1069,11 @@ std::vector<Express::VARP> Omni::forwardRaw(Express::VARP hiddenState, Express::
     extraArgs.insert(extraArgs.end(), mExtraArgs.begin(), mExtraArgs.end());
     auto outputs = Llm::forwardRaw(hiddenState, mask, inputPos, extraArgs);
     if (mTalker && outputs.size() > 1) {
-        mTalker->addTalkerEmbeds(outputs[1]);
+        if (outputs.size() > 2) {
+            mTalker->addTalkerEmbeds(outputs[2]);
+        } else {
+            mTalker->addTalkerEmbeds(outputs[1]);
+        }
     }
     return outputs;
 }
@@ -1264,17 +1268,75 @@ void Omni::generateWavform() {
 
 bool Talker::load() {
     initRuntime();
+    mMeta->layer_nums = mConfig->talker_layer_nums();
     mSeqLenIndex = 1;
     set_config("{\"sampler_type\": \"mixed\", \"temperature\": 0.9, \"topK\": 40, \"topP\": 0.8, \"penalty\": 1.05}");
     mSampler.reset(Sampler::createSampler(mContext, mConfig));
     mDiskEmbedding.reset(new DiskEmbedding(mConfig, mConfig->talker_embedding_file()));
     // some embeddings
     mMaxNewTokens = mConfig->talker_max_new_tokens();
+    mCodecGroupSize = mConfig->codec_group_size();
+    mCodecBosToken = mConfig->codec_bos();
+    mCodecEosToken = mConfig->codec_eos();
+    mCodecPadToken = mConfig->codec_pad();
     std::string speaker = mConfig->talker_speaker();
     auto spk_dict = Express::Variable::loadMap(mConfig->spk_dict().c_str());
     mSpk = spk_dict[speaker + "_spk"];
     mCond = spk_dict[speaker + "_cond"];
+    auto prompt_key = speaker + "_prompt_token";
+    if (spk_dict.count(prompt_key)) {
+        auto prompt_var = spk_dict[prompt_key];
+        auto prompt_ptr = prompt_var->readMap<int>();
+        int prompt_len = prompt_var->getInfo()->size;
+        mPromptTokens.assign(prompt_ptr, prompt_ptr + prompt_len);
+    }
     mTextBosToken = int(spk_dict[speaker + "_bos_token"]->readMap<float>()[0]);
+    // FunAudioChat CRQ uses 1D position IDs, Qwen2.5-Omni uses MRoPE
+    mUseMRoPE = (mCodecGroupSize == 1);
+    if (mCodecGroupSize > 1) {
+        vocoder_upsample_rate = 480; // CosyVoice3
+    }
+    if (mCodecGroupSize > 1) {
+        // Load pre_matching weights for FunAudioChat
+        auto pm_path = mConfig->pre_matching_file();
+        int hidden_size = mConfig->hidden_size(); // 4096
+        int pm_out = hidden_size * mCodecGroupSize; // 20480
+        // Read the bf16 binary file: weight [pm_out, hidden_size] then bias [pm_out]
+        std::ifstream pm_file(pm_path, std::ios::binary);
+        if (pm_file.is_open()) {
+            size_t weight_size = pm_out * hidden_size;
+            size_t bias_size = pm_out;
+            std::vector<int16_t> weight_bf16(weight_size);
+            std::vector<int16_t> bias_bf16(bias_size);
+            pm_file.read(reinterpret_cast<char*>(weight_bf16.data()), weight_size * 2);
+            pm_file.read(reinterpret_cast<char*>(bias_bf16.data()), bias_size * 2);
+            pm_file.close();
+            // Convert bf16 to fp32 and create VARPs
+            // Weight: [pm_out, hidden_size] — store transposed as [hidden_size, pm_out] for matmul
+            mPreMatchingWeight = _Input({hidden_size, pm_out}, NCHW, halide_type_of<float>());
+            auto wptr = mPreMatchingWeight->writeMap<float>();
+            for (int i = 0; i < hidden_size; i++) {
+                for (int j = 0; j < pm_out; j++) {
+                    // Transpose: wptr[i * pm_out + j] = weight[j * hidden_size + i]
+                    int16_t bf16_val = weight_bf16[j * hidden_size + i];
+                    uint32_t fp32_bits = ((uint32_t)bf16_val) << 16;
+                    float fp32_val;
+                    memcpy(&fp32_val, &fp32_bits, sizeof(float));
+                    wptr[i * pm_out + j] = fp32_val;
+                }
+            }
+            mPreMatchingBias = _Input({1, 1, pm_out}, NCHW, halide_type_of<float>());
+            auto bptr = mPreMatchingBias->writeMap<float>();
+            for (int j = 0; j < pm_out; j++) {
+                int16_t bf16_val = bias_bf16[j];
+                uint32_t fp32_bits = ((uint32_t)bf16_val) << 16;
+                float fp32_val;
+                memcpy(&fp32_val, &fp32_bits, sizeof(float));
+                bptr[j] = fp32_val;
+            }
+        } else {
+        }
+    }
     mTextBos = mThinker->embedding({mTextBosToken});
     mTextEos = mThinker->embedding({mTextEosToken});
     mTextPad = mThinker->embedding({mTextPadToken});
@@ -1282,23 +1344,33 @@ bool Talker::load() {
     mCodecPad = embedding({mCodecPadToken});
 
     Module::Config module_config;
-    module_config.shapeMutable = false;
+    module_config.shapeMutable = false; // Static module with KV cache managed by KVCACHE_INFO
     module_config.rearrange    = true;
-    std::vector<std::string> inputNames {"inputs_embeds", "attention_mask", "position_ids", "logits_index"};
+    std::vector<std::string> inputNames;
+    if (mCodecGroupSize > 1) {
+        // FunAudioChat CRQ talker: 3 inputs (no logits_index)
+        inputNames = {"inputs_embeds", "attention_mask", "position_ids"};
+    } else {
+        // Qwen2.5-Omni talker: 4 inputs (with logits_index)
+        inputNames = {"inputs_embeds", "attention_mask", "position_ids", "logits_index"};
+    }
 
     mModule.reset(Module::load(inputNames,
                                     {"logits"}, mConfig->talker_model().c_str(), mRuntimeManager, &module_config));
     if (mModule.get() == nullptr) {
         return false;
     }
-    // dit
+    // dit components: dynamic shapes for CosyVoice3, static for Qwen2.5-Omni
+    Module::Config dynamic_config;
+    dynamic_config.shapeMutable = (mCodecGroupSize > 1);
+    dynamic_config.rearrange    = true;
     mPreDit.reset(Module::load({"cond", "spk", "code"}, {"code_embeds", "rope", "mask"},
-                                mConfig->predit_model().c_str(), mRuntimeManager, &module_config));
+                                mConfig->predit_model().c_str(), mRuntimeManager, &dynamic_config));
     mDit.reset(Module::load({"x", "code_embeds", "rope", "mask", "time"}, {"mel"},
-                            mConfig->dit_model().c_str(), mRuntimeManager, &module_config));
+                            mConfig->dit_model().c_str(), mRuntimeManager, &dynamic_config));
     // bigvgan
     mBigvgan.reset(Module::load({"generated_mel"},
-                                {"waveform"}, mConfig->bigvgan_model().c_str(), mRuntimeManager, &module_config));
+                                {"waveform"}, mConfig->bigvgan_model().c_str(), mRuntimeManager, &dynamic_config));
     // autoregressive decode module
     mModulePool[std::make_pair(1, false)].reset(Module::clone(mModule.get()));
     // prefill module
@@ -1323,7 +1395,7 @@ void Talker::generate_init(std::ostream* os, const char* end_with) {
             mInitialNoise[i] = distribution(generator);
         }
     }
-    mWaveformBuffer.reserve(mMaxNewTokens * 2 * 240);
+    mWaveformBuffer.reserve(mMaxNewTokens * 2 * vocoder_upsample_rate);
     mMelBuffer = nullptr;
     dit_start_index = 0;
     dit_left_padding = 0;
@@ -1335,20 +1407,35 @@ Express::VARP Talker::embedding(const std::vector<int>& input_ids) {
 }
 
 Express::VARP Talker::gen_position_ids(int seq_len) {
-    // mrope
-    if (needNewVar(positionIds, 2, seq_len)) {
-        positionIds = _Input({3, 1, seq_len}, NCHW, halide_type_of<int>());
-    }
-    auto ptr = positionIds->writeMap<int>();
-    if (seq_len == 1) {
-        ptr[0] = mContext->gen_seq_len + mPositionIds.back();
-        ptr[1] = ptr[0];
-        ptr[2] = ptr[0];
+    if (mUseMRoPE) {
+        // MRoPE for Qwen2.5-Omni
+        if (needNewVar(positionIds, 2, seq_len)) {
+            positionIds = _Input({3, 1, seq_len}, NCHW, halide_type_of<int>());
+        }
+        auto ptr = positionIds->writeMap<int>();
+        if (seq_len == 1) {
+            ptr[0] = mContext->gen_seq_len + mPositionIds.back();
+            ptr[1] = ptr[0];
+            ptr[2] = ptr[0];
+        } else {
+            for (int i = 0; i < seq_len; i++) {
+                ptr[i] = mPositionIds.mT[i];
+                ptr[i + seq_len] = mPositionIds.mH[i];
+                ptr[i + seq_len * 2] = mPositionIds.mW[i];
+            }
+        }
     } else {
-        for (int i = 0; i < seq_len; i++) {
-            ptr[i] = mPositionIds.mT[i];
-            ptr[i + seq_len] = mPositionIds.mH[i];
-            ptr[i + seq_len * 2] = mPositionIds.mW[i];
+        // Standard 1D position IDs for FunAudioChat CRQ
+        if (needNewVar(positionIds, 1, seq_len)) {
+            positionIds = _Input({1, seq_len}, NCHW, halide_type_of<int>());
+        }
+        auto ptr = positionIds->writeMap<int>();
+        if (seq_len == 1) {
+            ptr[0] = mContext->all_seq_len;
+        } else {
+            for (int i = 0; i < seq_len; i++) {
+                ptr[i] = i;
+            }
         }
     }
     return positionIds;
@@ -1359,8 +1446,21 @@ void Talker::setWavformCallback(const std::function<bool(const float*, size_t, b
 }
 
 VARP Talker::ditForward(const int codec_size, const int* codec_tokens, const float* initial_noise) {
-    auto code = _Const(codec_tokens, {1, codec_size}, NCHW, halide_type_of<int>());
-    const int max_duration = codec_size * 2;
+    // Prepend prompt tokens if available (CosyVoice3)
+    std::vector<int> full_code;
+    int full_size;
+    const int* code_ptr;
+    if (!mPromptTokens.empty()) {
+        full_code.insert(full_code.end(), mPromptTokens.begin(), mPromptTokens.end());
+        full_code.insert(full_code.end(), codec_tokens, codec_tokens + codec_size);
+        full_size = full_code.size();
+        code_ptr = full_code.data();
+    } else {
+        full_size = codec_size;
+        code_ptr = codec_tokens;
+    }
+    auto code = _Const(code_ptr, {1, full_size}, NCHW, halide_type_of<int>());
+    const int max_duration = full_size * 2;
     auto outputs = mPreDit->onForward({mCond, mSpk, code});
     auto code_embeds = outputs[0];
     auto rope = outputs[1];
@@ -1373,7 +1473,7 @@ VARP Talker::ditForward(const int codec_size, const int* codec_tokens, const flo
         return pred;
     };
     auto y0 = _Input({1, max_duration, 80}, NCHW, halide_type_of<float>());
-    if (initial_noise) {
+    if (initial_noise && mPromptTokens.empty()) {
         for (int i = 0; i < max_duration * 80; ++i) {
             y0->writeMap<float>()[i] = initial_noise[i];
         }
@@ -1470,8 +1570,134 @@ int Talker::sample(Express::VARP logits, int offset, int size) {
     return token;
 }
 
+std::vector<Express::VARP> Talker::forwardRaw(Express::VARP hiddenState, Express::VARP mask, Express::VARP inputPos, Express::VARPS extraArgs) {
+    if (mCodecGroupSize > 1) {
+        // FunAudioChat CRQ: 3 inputs only (no logits_index)
+        // CRQ has no prefill — every call is decode (seq_len=1)
+        int seqLen = hiddenState->getInfo()->dim[mSeqLenIndex];
+        auto moduleKey = std::make_pair(seqLen, false);
+        std::shared_ptr<Module> selectModule = mModule;
+        if (mModulePool.find(moduleKey) != mModulePool.end()) {
+            selectModule = mModulePool[moduleKey];
+        }
+
+        // CRQ module expects proper 4D mask (not CPU scalar optimization)
+        int kv_seq_len = mContext->all_seq_len + seqLen;
+        auto properMask = _Input({1, 1, seqLen, kv_seq_len}, NCHW, halide_type_of<float>());
+        auto maskPtr = properMask->writeMap<float>();
+        for (int i = 0; i < seqLen; i++) {
+            int query_pos = i + (kv_seq_len - seqLen);
+            for (int j = 0; j < kv_seq_len; j++) {
+                maskPtr[kv_seq_len * i + j] = (j > query_pos) ? std::numeric_limits<float>::lowest() : 0.0f;
+            }
+        }
+
+        std::vector<Express::VARP> inputs {hiddenState, properMask, inputPos};
+        auto outputs = selectModule->onForward(inputs);
+        if (outputs.empty()) {
+            return outputs;
+        }
+        ((MNN::Tensor*)(outputs[0]->getTensor()))->wait(Tensor::MAP_TENSOR_READ, true);
+        return outputs;
+    }
+    return Llm::forwardRaw(hiddenState, mask, inputPos, extraArgs);
+}
+
 void Talker::generate() {
     if (!doGenerate()) { return; }
+
+    if (mCodecGroupSize > 1) {
+        // FunAudioChat: group-based generation with pre_matching
+        // mTalkerEmbeds[0] = prefill context (NOT used by CRQ, skip it)
+        // mTalkerEmbeds[1..K] = decode-phase talker_embeds
+        int num_decode_embeds = (int)mTalkerEmbeds.size() - 1; // exclude prefill
+        if (num_decode_embeds < 1) {
+            return;
+        }
+
+        // Pre-compute pre_matching for all decode embeds
+        // Each [1, 1, 4096] → matmul with weight → [1, 1, 20480] → reshape [1, 5, 4096]
+        int hidden_size = mConfig->hidden_size();
+        int pm_out = hidden_size * mCodecGroupSize;
+        std::vector<VARP> pre_matched; // each is [1, 5, 4096]
+        for (int k = 1; k <= num_decode_embeds; k++) {
+            auto embed = mTalkerEmbeds[k]; // [1, 1, 4096]
+            auto embed_2d = _Reshape(embed, {1, hidden_size});
+            auto projected = _MatMul(embed_2d, mPreMatchingWeight) + _Reshape(mPreMatchingBias, {1, pm_out});
+            // projected shape: [1, 20480] → reshape to [1, 5, 4096]
+            auto expanded = _Reshape(projected, {1, mCodecGroupSize, hidden_size});
+            pre_matched.push_back(expanded);
+        }
+        // Generate codec tokens: for each LLM step, generate group_size tokens
+        VARP audio_embed = mCodecBos; // start with BOS codec embedding, shape [1, 1, 4096]
+        MNN::Timer _t;
+        std::vector<int> codec_tokens;
+        bool first_token = true;
+
+        // Use module directly instead of Llm::forward chain
+        auto& decodeModule = mModule; // shapeMutable=true module
+        int total_seq_len = 0; // CRQ's own position counter
+
+        for (int g = 0; g < (int)pre_matched.size(); g++) {
+            for (int s = 0; s < mCodecGroupSize; s++) {
+                // slot = pre_matched[g][:, s:s+1, :] — _Slice uses SIZES not ENDS
+                auto starts = _var<int>({0, s, 0}, {3});
+                auto sizes = _var<int>({1, 1, hidden_size}, {3});
+                auto slot_embed = _Slice(pre_matched[g], starts, sizes);
+
+                // input = slot + audio_embed
+                auto input_embeds = slot_embed + audio_embed;
+                input_embeds = _Reshape(input_embeds, {1, 1, hidden_size});
+
+                // Build attention mask: [1, 1, 1, kv_seq_len]
+                int kv_seq_len = total_seq_len + 1;
+                auto mask = _Input({1, 1, 1, kv_seq_len}, NCHW, halide_type_of<float>());
+                auto maskPtr = mask->writeMap<float>();
+                for (int j = 0; j < kv_seq_len; j++) {
+                    maskPtr[j] = 0.0f; // all visible (causal: current token can see all previous)
+                }
+                // Build position IDs: [1, 1]
+                auto posIds = _Input({1, 1}, NCHW, halide_type_of<int>());
+                posIds->writeMap<int>()[0] = total_seq_len;
+
+                // Forward through CRQ module directly
+                mMeta->add = 1;
+                auto outputs = decodeModule->onForward({input_embeds, mask, posIds});
+                if (outputs.empty()) {
+                    goto done;
+                }
+                auto logits = outputs[0];
+                total_seq_len++;
+
+                if (first_token) {
+                    mContext->prefill_us += _t.durationInUs();
+                    _t.reset();
+                    first_token = false;
+                }
+
+                // Sample
+                mContext->current_token = sample(logits);
+                codec_tokens.push_back(mContext->current_token);
+                mContext->history_tokens.push_back(mContext->current_token);
+                mContext->output_tokens.push_back(mContext->current_token);
+                mContext->gen_seq_len++;
+                mContext->all_seq_len++;
+
+                // Check for EOS
+                if (mContext->current_token == mCodecEosToken) {
+                    goto done;
+                }
+
+                // Update audio_embed for next step
+                audio_embed = embedding({mContext->current_token}); // [1, 1, 4096]
+            }
+        }
+        done:
+        mContext->decode_us += _t.durationInUs();
+        token2wav(true);
+        return;
+    }
+
     mTalkerEmbeds.push_back(mTextEos);
     auto input_embeds = _Concat({mTalkerEmbeds[0], mTextBos + mCodecPad, mTalkerEmbeds[1] + mCodecBos}, 1);
     // push 2 token ids

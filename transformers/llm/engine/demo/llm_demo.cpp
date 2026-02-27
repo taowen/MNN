@@ -13,7 +13,7 @@
 #include <sstream>
 #include <stdlib.h>
 #include <initializer_list>
-//#define LLM_SUPPORT_AUDIO
+#define LLM_SUPPORT_AUDIO
 #ifdef LLM_SUPPORT_AUDIO
 #include "audio/audio.hpp"
 #endif

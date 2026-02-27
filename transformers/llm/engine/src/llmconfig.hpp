@@ -394,6 +394,10 @@ public:
         return base_dir_ + config_.value("spk_dict", "spk_dict.mnn");
     }
 
+    std::string pre_matching_file() const {
+        return base_dir_ + config_.value("pre_matching_file", "pre_matching_bf16.bin");
+    }
+
     int talker_max_new_tokens() const {
         return config_.value("talker_max_new_tokens", 2048);
     }
@@ -410,6 +414,10 @@ public:
     int dit_solver() const {
         // 1: OED, 4: RungeKutta4ODE
         return config_.value("dit_solver", 1);
+    }
+
+    int talker_layer_nums() const {
+        return config_.value("talker_layer_nums", 28);
     }
     // talker config end
 
@@ -432,6 +440,22 @@ public:
 
     bool has_talker() const {
         return config_.value("has_talker", false);
+    }
+
+    int codec_group_size() const {
+        return config_.value("codec_group_size", 1);
+    }
+
+    int codec_bos() const {
+        return config_.value("codec_bos", 8293);
+    }
+
+    int codec_eos() const {
+        return config_.value("codec_eos", 8294);
+    }
+
+    int codec_pad() const {
+        return config_.value("codec_pad", 8292);
     }
 
     bool has_deepstack() const {
